@@ -1,0 +1,41 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime config (generated per-run)
+app/pipeline_config.json
+
+# Database files (too large for git — user places these manually)
+DBs/*.bson
+DBs/*.json
+DBs/*.tsv
+DBs/*.csv
+
+# Pipeline output (generated results)
+results/*
+!results/.gitkeep
+
+# MongoDB local data
+data/
+
+# R generated files
+R/Rplots.pdf
+*.Rhistory
+*.RData
+*.Rproj.user/
+
+# Backups
+*_BACKUP.*
+*_backup.*
+
+# Claude settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
