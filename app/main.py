@@ -4,8 +4,10 @@ Runs R modules (Part I-IV) with a visual configuration panel.
 """
 
 import glob as _glob
+import io
 import json
 import shutil
+import zipfile
 import socket
 import subprocess
 import time
@@ -536,7 +538,6 @@ with tab_setup:
 with tab_preview:
 
     def _find_taxon_col(df: pd.DataFrame, hints: list[str]) -> str | None:
-        """Return the first column whose name contains any of the hint keywords."""
         for hint in hints:
             for col in df.columns:
                 if hint in col.lower():
@@ -554,6 +555,34 @@ with tab_preview:
                 return pd.read_csv(path, nrows=nrows)
         except Exception:
             return None
+
+    def _dark_layout(fig, height: int = 420):
+        fig.update_layout(
+            height=height,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            font_color="#ccc",
+            margin=dict(t=50, b=40, l=40, r=20),
+        )
+        return fig
+
+    # Solvent polarity zones for xLogP interpretation
+    _SOLVENT_ZONES = [
+        ("Water",         None,  0.0, "rgba(30,144,255,0.12)"),
+        ("Hydroalcoholic", 0.0,  1.5, "rgba(100,200,255,0.12)"),
+        ("Ethanol",        1.5,  2.5, "rgba(80,200,120,0.12)"),
+        ("EtOAc",          2.5,  4.0, "rgba(255,200,60,0.12)"),
+        ("Hexane",         4.0, None, "rgba(255,100,60,0.12)"),
+    ]
+
+    # Priority class colour map
+    _CLASS_COLORS = {
+        "STAR":     "#FFD700",
+        "GEM":      "#00CED1",
+        "HIT":      "#3CB371",
+        "BASELINE": "#888888",
+        "DISCARD":  "#CC4444",
+    }
 
     out_dir_prev = Path(out_dir_str) if "out_dir_str" in dir() else RESULTS_DIR
     prev_dirs = []
@@ -578,162 +607,534 @@ with tab_preview:
 
             # ── Locate main parquet files ──────────────────────────────────────
             all_pq = list(sel_prev.glob("*.parquet"))
-            lin_pq = next(
-                (f for f in all_pq if "lin_enriched" in f.name), None)
-            uni_pq = next(
-                (f for f in all_pq if "uni_enriched" in f.name), None)
-            main_df = _load_df(uni_pq) if uni_pq else (
-                _load_df(lin_pq) if lin_pq else None)
+            lin_pq = next((f for f in all_pq if "lin_enriched" in f.name), None)
+            uni_pq = next((f for f in all_pq if "uni_enriched" in f.name), None)
+
+            # unique compounds preferred for most charts; lin for taxon counts
+            uni_df  = _load_df(uni_pq) if uni_pq else None
+            lin_df  = _load_df(lin_pq) if lin_pq else None
+            main_df = uni_df if uni_df is not None else lin_df
 
             # ── Metrics row ───────────────────────────────────────────────────
             if main_df is not None:
-                tax_col = _find_taxon_col(
-                    main_df, ["genus", "species", "family", "taxon"])
-                inchi_col = _find_taxon_col(
-                    main_df, ["inchikey", "inchi_key", "structure"])
+                inchi_col = _find_taxon_col(main_df, ["inchikey", "inchi_key"])
+                genus_col = _find_taxon_col(main_df, ["genus"])
+                family_col = _find_taxon_col(main_df, ["family"])
 
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Rows (compounds)", f"{len(main_df):,}")
-                m1.caption(Path(uni_pq or lin_pq).name)
-                if inchi_col:
-                    m2.metric("Unique structures",
-                              f"{main_df[inchi_col].nunique():,}")
-                if tax_col:
-                    m3.metric(
-                        f"Unique {tax_col.split('_')[-1]}", f"{main_df[tax_col].nunique():,}")
-                total_mb = sum(f.stat().st_size for f in sel_prev.rglob(
-                    "*") if f.is_file()) / 1e6
-                m4.metric("Total output size", f"{total_mb:.1f} MB")
+                n_total    = len(lin_df) if lin_df is not None else len(main_df)
+                n_unique   = main_df[inchi_col].nunique() if inchi_col else len(main_df)
+                n_genera   = main_df[genus_col].nunique() if genus_col else 0
+                total_mb   = sum(
+                    f.stat().st_size for f in sel_prev.rglob("*") if f.is_file()
+                ) / 1e6
 
+                m1.metric("Total occurrences", f"{n_total:,}")
+                m2.metric("Unique structures",  f"{n_unique:,}")
+                m3.metric("Genera",             f"{n_genera:,}" if n_genera else "—")
+                m4.metric("Output size",        f"{total_mb:.1f} MB")
                 st.divider()
 
-            # ── Charts ────────────────────────────────────────────────────────
-            chart_df = _load_df(lin_pq) if lin_pq else main_df
-            if chart_df is not None:
-                st.subheader("📈 Charts")
-                ctab1, ctab2, ctab3 = st.tabs(
-                    ["Top taxa", "Compound distribution", "Heatmap preview"])
+            # ── Chart tabs ────────────────────────────────────────────────────
+            if main_df is not None:
+                # Discover columns once — used across multiple tabs
+                sup_col      = next((c for c in main_df.columns if "npclassifier" in c.lower() and "superclass" in c.lower()), None)
+                cls_col      = next((c for c in main_df.columns if "npclassifier" in c.lower() and "class" in c.lower() and "superclass" not in c.lower()), None)
+                mw_col       = next((c for c in main_df.columns if c.lower() in ("molecular_weight", "mw")), None)
+                logp_col     = next((c for c in main_df.columns if c.lower() in ("xlogp", "alogp", "logp")), None)
+                ring_col     = next((c for c in main_df.columns if "ring" in c.lower()), None)
+                scaffold_col = next((c for c in main_df.columns if "murko" in c.lower() or "scaffold" in c.lower()), None)
+                sugar_col    = next((c for c in main_df.columns if "sugar" in c.lower()), None)
+                nc_col       = next((c for c in main_df.columns if c.lower() == "number_of_carbons"), None)
 
+                st.subheader("📈 Chemical Analysis")
+                ctab1, ctab2, ctab3, ctab4 = st.tabs([
+                    "🌿 Chemical Classes",
+                    "⚗️ Chemical Space",
+                    "🔬 Scaffolds & Structure",
+                    "🏆 Priority Results",
+                ])
+
+                # ── Tab 1: Chemical class distribution ────────────────────────
                 with ctab1:
-                    tax_col = _find_taxon_col(
-                        chart_df, ["genus", "species", "family"])
-                    if tax_col:
-                        top_n = st.slider("Show top N taxa",
-                                          5, 50, 20, key="chart_topn")
-                        counts = (
-                            chart_df[tax_col]
+
+                    col_left, col_right = st.columns([1, 1])
+
+                    with col_left:
+                        if sup_col and main_df[sup_col].notna().any():
+                            sup_series = (
+                                main_df[sup_col]
+                                .dropna()
+                                .astype(str)
+                                .str.strip()
+                            )
+                            # Drop numeric-only values and very short strings (classifier artifacts)
+                            sup_series = sup_series[
+                                ~sup_series.str.match(r"^\d+(\.\d+)?$") & (sup_series.str.len() >= 3)
+                            ]
+                            sup_counts = (
+                                sup_series
+                                .value_counts()
+                                .reset_index()
+                            )
+                            sup_counts.columns = ["Superclass", "count"]
+                            fig_donut = px.pie(
+                                sup_counts,
+                                names="Superclass",
+                                values="count",
+                                hole=0.45,
+                                title="Superclass distribution (NPClassifier)",
+                                color_discrete_sequence=px.colors.qualitative.Pastel,
+                            )
+                            fig_donut.update_traces(textposition="inside", textinfo="percent+label")
+                            st.plotly_chart(_dark_layout(fig_donut, 420), use_container_width=True)
+                        else:
+                            st.info("NPClassifier Superclass column not found in this dataset.")
+
+                    with col_right:
+                        if sup_col and genus_col and main_df[sup_col].notna().any():
+                            # Clean superclass column before grouping
+                            _sup_clean = main_df[sup_col].astype(str).str.strip()
+                            _sup_valid = _sup_clean[
+                                ~_sup_clean.str.match(r"^\d+(\.\d+)?$") & (_sup_clean.str.len() >= 3)
+                            ].index
+                            _sub_df = main_df.loc[_sup_valid].copy()
+                            _sub_df[sup_col] = _sup_clean.loc[_sup_valid]
+
+                            top_genera = (
+                                _sub_df[genus_col]
+                                .value_counts()
+                                .head(15)
+                                .index
+                            )
+                            top_classes = (
+                                _sub_df[sup_col]
+                                .value_counts()
+                                .head(8)
+                                .index
+                            )
+                            sub = _sub_df[
+                                _sub_df[genus_col].isin(top_genera)
+                                & _sub_df[sup_col].isin(top_classes)
+                            ]
+                            pivot = (
+                                sub.groupby([genus_col, sup_col])
+                                .size()
+                                .reset_index(name="count")
+                            )
+                            fig_stack = px.bar(
+                                pivot,
+                                x=genus_col,
+                                y="count",
+                                color=sup_col,
+                                title="Chemical class profile per genus (top 15)",
+                                labels={genus_col: "Genus", "count": "Compounds", sup_col: "Class"},
+                                color_discrete_sequence=px.colors.qualitative.Pastel,
+                            )
+                            fig_stack.update_layout(barmode="stack", xaxis_tickangle=-40)
+                            st.plotly_chart(_dark_layout(fig_stack, 420), use_container_width=True)
+                        elif sup_col and family_col and main_df[sup_col].notna().any():
+                            _sup_clean2 = main_df[sup_col].astype(str).str.strip()
+                            _sup_valid2 = _sup_clean2[
+                                ~_sup_clean2.str.match(r"^\d+(\.\d+)?$") & (_sup_clean2.str.len() >= 3)
+                            ].index
+                            _sub_df2 = main_df.loc[_sup_valid2].copy()
+                            _sub_df2[sup_col] = _sup_clean2.loc[_sup_valid2]
+
+                            top_families = (
+                                _sub_df2[family_col]
+                                .value_counts()
+                                .head(15)
+                                .index
+                            )
+                            top_classes = (
+                                _sub_df2[sup_col]
+                                .value_counts()
+                                .head(8)
+                                .index
+                            )
+                            sub = _sub_df2[
+                                _sub_df2[family_col].isin(top_families)
+                                & _sub_df2[sup_col].isin(top_classes)
+                            ]
+                            pivot = (
+                                sub.groupby([family_col, sup_col])
+                                .size()
+                                .reset_index(name="count")
+                            )
+                            fig_stack = px.bar(
+                                pivot,
+                                x=family_col,
+                                y="count",
+                                color=sup_col,
+                                title="Chemical class profile per family (top 15)",
+                                labels={family_col: "Family", "count": "Compounds", sup_col: "Class"},
+                                color_discrete_sequence=px.colors.qualitative.Pastel,
+                            )
+                            fig_stack.update_layout(barmode="stack", xaxis_tickangle=-40)
+                            st.plotly_chart(_dark_layout(fig_stack, 420), use_container_width=True)
+                        else:
+                            st.info("Need genus/family + NPClassifier columns for the stacked chart.")
+
+                    # NPClassifier Class breakdown (secondary level)
+                    if cls_col and main_df[cls_col].notna().any():
+                        top_n_cls = st.slider("Show top N classes", 5, 30, 15, key="cls_topn")
+                        _cls_clean = main_df[cls_col].dropna().astype(str).str.strip()
+                        _cls_clean = _cls_clean[
+                            ~_cls_clean.str.match(r"^\d+(\.\d+)?$") & (_cls_clean.str.len() >= 3)
+                        ]
+                        cls_counts = (
+                            _cls_clean
                             .value_counts()
-                            .head(top_n)
+                            .head(top_n_cls)
                             .reset_index()
                         )
-                        counts.columns = [tax_col, "count"]
-                        fig = px.bar(
-                            counts.sort_values("count"),
-                            x="count", y=tax_col,
+                        cls_counts.columns = ["Class", "count"]
+                        fig_cls = px.bar(
+                            cls_counts.sort_values("count"),
+                            x="count",
+                            y="Class",
                             orientation="h",
-                            title=f"Compounds per {tax_col.split('_')[-1]} (top {top_n})",
-                            labels={"count": "# compounds", tax_col: ""},
+                            title=f"Top {top_n_cls} NPClassifier Classes",
+                            labels={"count": "Compounds", "Class": ""},
                             color="count",
                             color_continuous_scale="teal",
                         )
-                        fig.update_layout(
-                            height=max(300, top_n * 22),
-                            showlegend=False,
-                            coloraxis_showscale=False,
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            font_color="#ccc",
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("No taxonomic column detected in the data.")
+                        fig_cls.update_layout(coloraxis_showscale=False, showlegend=False)
+                        st.plotly_chart(_dark_layout(fig_cls, max(300, top_n_cls * 24)), use_container_width=True)
 
+                # ── Tab 2: Chemical space ─────────────────────────────────────
                 with ctab2:
-                    num_cols = chart_df.select_dtypes(
-                        include="number").columns.tolist()
-                    num_cols = [
-                        c for c in num_cols if chart_df[c].nunique() > 2]
-                    if num_cols:
-                        chosen_num = st.selectbox(
-                            "Column to plot", num_cols, key="hist_col")
-                        fig2 = px.histogram(
-                            chart_df,
-                            x=chosen_num,
-                            nbins=40,
-                            title=f"Distribution of {chosen_num}",
+                    col_l2, col_r2 = st.columns([1, 1])
+
+                    with col_l2:
+                        if mw_col and logp_col:
+                            scatter_df = main_df[[mw_col, logp_col]].dropna()
+                            color_scatter = sup_col if (sup_col and sup_col in main_df.columns) else None
+                            if color_scatter:
+                                scatter_df = main_df[[mw_col, logp_col, color_scatter]].dropna()
+
+                            fig_space = px.scatter(
+                                scatter_df.sample(min(3000, len(scatter_df)), random_state=42),
+                                x=mw_col,
+                                y=logp_col,
+                                color=color_scatter,
+                                opacity=0.55,
+                                title="Chemical space (MW vs logP)",
+                                labels={mw_col: "Molecular weight (Da)", logp_col: "logP"},
+                                color_discrete_sequence=px.colors.qualitative.Pastel,
+                            )
+                            # Lipinski Rule of Five box
+                            fig_space.add_shape(
+                                type="rect",
+                                x0=0, x1=500, y0=-5, y1=5,
+                                line=dict(color="#FFD700", width=1, dash="dot"),
+                                fillcolor="rgba(255,215,0,0.04)",
+                            )
+                            fig_space.add_annotation(
+                                x=500, y=5, text="Lipinski RO5",
+                                showarrow=False, font=dict(size=10, color="#FFD700"),
+                                xanchor="right", yanchor="bottom",
+                            )
+                            st.plotly_chart(_dark_layout(fig_space, 420), use_container_width=True)
+                        else:
+                            st.info("Molecular weight and/or logP columns not found.")
+
+                    with col_r2:
+                        if logp_col and main_df[logp_col].notna().any():
+                            logp_data = main_df[logp_col].dropna()
+                            fig_logp = px.histogram(
+                                logp_data,
+                                nbins=50,
+                                title="logP distribution — extraction solvent guide",
+                                labels={"value": "logP", "count": "Compounds"},
+                                color_discrete_sequence=["#5599ff"],
+                            )
+                            # Add solvent zone shading
+                            xmin = float(logp_data.min()) - 0.5
+                            xmax = float(logp_data.max()) + 0.5
+                            for label, lo, hi, color in _SOLVENT_ZONES:
+                                x0 = xmin if lo is None else lo
+                                x1 = xmax if hi is None else hi
+                                fig_logp.add_vrect(
+                                    x0=x0, x1=x1,
+                                    fillcolor=color,
+                                    line_width=0,
+                                    annotation_text=label,
+                                    annotation_position="top",
+                                    annotation=dict(font_size=10, font_color="#ccc"),
+                                )
+                            st.plotly_chart(_dark_layout(fig_logp, 420), use_container_width=True)
+                        else:
+                            st.info("logP column not found.")
+
+                    # MW distribution
+                    if mw_col and main_df[mw_col].notna().any():
+                        fig_mw = px.histogram(
+                            main_df[mw_col].dropna(),
+                            nbins=60,
+                            title="Molecular weight distribution",
+                            labels={"value": "MW (Da)", "count": "Compounds"},
                             color_discrete_sequence=["#2ecc71"],
                         )
-                        fig2.update_layout(
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            font_color="#ccc",
-                        )
-                        st.plotly_chart(fig2, use_container_width=True)
-                    else:
-                        st.info("No numeric columns available for histogram.")
+                        fig_mw.add_vline(x=500, line_dash="dot", line_color="#FFD700",
+                                         annotation_text="500 Da (Lipinski)", annotation_position="top right")
+                        st.plotly_chart(_dark_layout(fig_mw, 300), use_container_width=True)
 
+                # ── Tab 3: Scaffolds & Structure ──────────────────────────────
                 with ctab3:
-                    tax_col2 = _find_taxon_col(chart_df, ["genus", "family"])
-                    num_col2 = next(
-                        (c for c in chart_df.select_dtypes(include="number").columns
-                         if chart_df[c].nunique() > 2), None
-                    )
-                    if tax_col2 and num_col2:
-                        top20 = chart_df[tax_col2].value_counts().head(
-                            20).index
-                        pivot = (
-                            chart_df[chart_df[tax_col2].isin(top20)]
-                            .groupby(tax_col2)[num_col2]
-                            .mean()
+                    col_l3, col_r3 = st.columns([1, 1])
+
+                    with col_l3:
+                        if ring_col and main_df[ring_col].notna().any():
+                            ring_counts = (
+                                pd.to_numeric(main_df[ring_col], errors="coerce")
+                                .dropna()
+                                .astype(int)
+                                .value_counts()
+                                .sort_index()
+                                .reset_index()
+                            )
+                            ring_counts.columns = ["Rings", "count"]
+                            fig_rings = px.bar(
+                                ring_counts,
+                                x="Rings",
+                                y="count",
+                                title="Ring count distribution",
+                                labels={"count": "Compounds"},
+                                color="count",
+                                color_continuous_scale="purp",
+                            )
+                            fig_rings.update_layout(coloraxis_showscale=False, xaxis=dict(dtick=1))
+                            st.plotly_chart(_dark_layout(fig_rings, 380), use_container_width=True)
+                        else:
+                            st.info("Ring count column (max_number_of_rings) not found.")
+
+                    with col_r3:
+                        if sugar_col and main_df[sugar_col].notna().any():
+                            sugar_vals = main_df[sugar_col].dropna()
+                            # normalise to boolean-like labels
+                            sugar_map  = sugar_vals.map(
+                                lambda v: "Glycoside (contains sugar)" if str(v).strip().lower() in ("true", "1", "yes") else "Aglycone"
+                            )
+                            pie_data = sugar_map.value_counts().reset_index()
+                            pie_data.columns = ["Type", "count"]
+                            fig_sugar = px.pie(
+                                pie_data,
+                                names="Type",
+                                values="count",
+                                hole=0.4,
+                                title="Glycosides vs aglycones",
+                                color_discrete_map={
+                                    "Glycoside (contains sugar)": "#4FC3F7",
+                                    "Aglycone": "#81C784",
+                                },
+                            )
+                            fig_sugar.update_traces(textposition="inside", textinfo="percent+label")
+                            st.plotly_chart(_dark_layout(fig_sugar, 380), use_container_width=True)
+                        else:
+                            st.info("Sugar column (contains_sugar) not found.")
+
+                    # Murcko scaffold frequency
+                    if scaffold_col and main_df[scaffold_col].notna().any():
+                        top_n_scaf = st.slider("Top scaffolds to show", 5, 30, 15, key="scaf_n")
+                        scaf_counts = (
+                            main_df[scaffold_col]
+                            .dropna()
+                            .value_counts()
+                            .head(top_n_scaf)
                             .reset_index()
-                            .sort_values(num_col2, ascending=False)
                         )
-                        fig3 = px.bar(
-                            pivot, x=tax_col2, y=num_col2,
-                            title=f"Mean {num_col2} by {tax_col2.split('_')[-1]} (top 20)",
-                            color=num_col2,
-                            color_continuous_scale="viridis",
+                        scaf_counts.columns = ["Scaffold (SMILES)", "count"]
+                        scaf_counts["label"] = scaf_counts["Scaffold (SMILES)"].str[:40] + "…"
+                        fig_scaf = px.bar(
+                            scaf_counts.sort_values("count"),
+                            x="count",
+                            y="label",
+                            orientation="h",
+                            title=f"Top {top_n_scaf} Murcko scaffolds by frequency",
+                            labels={"count": "Compounds sharing scaffold", "label": ""},
+                            color="count",
+                            color_continuous_scale="oranges",
                         )
-                        fig3.update_layout(
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            font_color="#ccc",
+                        fig_scaf.update_layout(coloraxis_showscale=False, showlegend=False)
+                        st.plotly_chart(_dark_layout(fig_scaf, max(300, top_n_scaf * 26)), use_container_width=True)
+
+                    # Carbon count distribution (proxy for compound size/class)
+                    if nc_col and main_df[nc_col].notna().any():
+                        fig_nc = px.histogram(
+                            main_df[nc_col].dropna(),
+                            nbins=40,
+                            title="Carbon count distribution",
+                            labels={"value": "Number of carbons", "count": "Compounds"},
+                            color_discrete_sequence=["#ffab40"],
                         )
-                        st.plotly_chart(fig3, use_container_width=True)
-                    else:
+                        st.plotly_chart(_dark_layout(fig_nc, 300), use_container_width=True)
+
+                # ── Tab 4: Priority Results ───────────────────────────────────
+                with ctab4:
+                    master_file = next(
+                        (f for f in sel_prev.rglob("*MASTER_LIST_GLOBAL*.xlsx")), None
+                    )
+                    if master_file is None:
                         st.info(
-                            "Need a taxon column + numeric column to build this chart.")
+                            "No MASTER_LIST_GLOBAL file found. Run Part IV to generate priority scores."
+                        )
+                    else:
+                        master_df = _load_df(master_file)
+                        if master_df is not None:
+                            # Normalise column names
+                            master_df.columns = [c.strip() for c in master_df.columns]
+
+                            score_g  = next((c for c in master_df.columns if "score_global"   in c.lower()), None)
+                            score_p  = next((c for c in master_df.columns if "score_potency"  in c.lower()), None)
+                            score_l  = next((c for c in master_df.columns if "score_local"    in c.lower() or "lle" in c.lower()), None)
+                            class_col = next((c for c in master_df.columns if c.lower() == "class"), None)
+                            bio_col   = next((c for c in master_df.columns if "biogeograph"   in c.lower()), None)
+                            pri_col   = next((c for c in master_df.columns if "primary_class" in c.lower()), None)
+                            potency_col = next((c for c in master_df.columns if "potency_nm"  in c.lower()), None)
+
+                            col_l4, col_r4 = st.columns([1, 1])
+
+                            with col_l4:
+                                if score_g and score_p:
+                                    _cols_m = [c for c in [score_g, score_p, class_col] if c]
+                                    scatter_m = master_df[_cols_m].copy()
+                                    if class_col:
+                                        scatter_m[class_col] = scatter_m[class_col].fillna("UNKNOWN")
+                                    scatter_m = scatter_m.dropna(subset=[score_g, score_p])
+                                    color_col_m = class_col if class_col else None
+                                    fig_prio = px.scatter(
+                                        scatter_m,
+                                        x=score_g,
+                                        y=score_p,
+                                        color=color_col_m,
+                                        title="Priority matrix — Global vs Potency score",
+                                        labels={score_g: "Global rarity score", score_p: "Potency score"},
+                                        color_discrete_map=_CLASS_COLORS,
+                                        opacity=0.75,
+                                        size_max=8,
+                                    )
+                                    # Quadrant lines
+                                    mid_g = scatter_m[score_g].median()
+                                    mid_p = scatter_m[score_p].median()
+                                    fig_prio.add_vline(x=mid_g, line_dash="dot", line_color="#555")
+                                    fig_prio.add_hline(y=mid_p, line_dash="dot", line_color="#555")
+                                    st.plotly_chart(_dark_layout(fig_prio, 420), use_container_width=True)
+                                elif score_g:
+                                    hist_p = px.histogram(
+                                        master_df[score_g].dropna(),
+                                        nbins=40,
+                                        title="Global rarity score distribution",
+                                        color_discrete_sequence=["#FFD700"],
+                                    )
+                                    st.plotly_chart(_dark_layout(hist_p, 420), use_container_width=True)
+                                else:
+                                    st.info("Score columns not found in MASTER_LIST_GLOBAL.")
+
+                            with col_r4:
+                                if class_col and master_df[class_col].notna().any():
+                                    cls_pie = (
+                                        master_df[class_col]
+                                        .fillna("UNKNOWN")
+                                        .value_counts()
+                                        .reset_index()
+                                    )
+                                    cls_pie.columns = ["Class", "count"]
+                                    fig_cls_pie = px.pie(
+                                        cls_pie,
+                                        names="Class",
+                                        values="count",
+                                        hole=0.45,
+                                        title="Compound classification (STAR / GEM / HIT…)",
+                                        color="Class",
+                                        color_discrete_map=_CLASS_COLORS,
+                                    )
+                                    fig_cls_pie.update_traces(textposition="inside", textinfo="percent+label")
+                                    st.plotly_chart(_dark_layout(fig_cls_pie, 420), use_container_width=True)
+                                elif bio_col and master_df[bio_col].notna().any():
+                                    bio_pie = (
+                                        master_df[bio_col]
+                                        .fillna("Unknown")
+                                        .value_counts()
+                                        .reset_index()
+                                    )
+                                    bio_pie.columns = ["Biogeography", "count"]
+                                    fig_bio = px.pie(
+                                        bio_pie,
+                                        names="Biogeography",
+                                        values="count",
+                                        hole=0.45,
+                                        title="Biogeography / rarity status",
+                                        color_discrete_sequence=px.colors.qualitative.Set2,
+                                    )
+                                    fig_bio.update_traces(textposition="inside", textinfo="percent+label")
+                                    st.plotly_chart(_dark_layout(fig_bio, 420), use_container_width=True)
+                                else:
+                                    st.info("Class / Biogeography column not found.")
+
+                            # Biogeography bar (if class and bio both exist)
+                            if bio_col and master_df[bio_col].notna().any():
+                                bio_counts = (
+                                    master_df[bio_col]
+                                    .fillna("Unknown")
+                                    .value_counts()
+                                    .reset_index()
+                                )
+                                bio_counts.columns = ["Biogeography status", "count"]
+                                fig_bio_bar = px.bar(
+                                    bio_counts.sort_values("count"),
+                                    x="count",
+                                    y="Biogeography status",
+                                    orientation="h",
+                                    title="Compound rarity by biogeographic distribution",
+                                    labels={"count": "Compounds"},
+                                    color="count",
+                                    color_continuous_scale="reds_r",
+                                )
+                                fig_bio_bar.update_layout(coloraxis_showscale=False)
+                                st.plotly_chart(_dark_layout(fig_bio_bar, 320), use_container_width=True)
+
+                            # Top priority compounds table
+                            st.markdown("**Top 20 priority compounds**")
+                            display_cols = [c for c in [
+                                pri_col, class_col, score_g, score_p, score_l,
+                                potency_col, bio_col,
+                                "iupac_name", "molecular_formula",
+                            ] if c and c in master_df.columns]
+                            if display_cols:
+                                top20_df = (
+                                    master_df[display_cols]
+                                    .dropna(subset=[c for c in [score_g, class_col] if c])
+                                    .head(20)
+                                )
+                                st.dataframe(top20_df, use_container_width=True, height=320)
 
                 st.divider()
 
             # ── Image Gallery ─────────────────────────────────────────────────
-            images = sorted(sel_prev.rglob("*.png")) + \
-                sorted(sel_prev.rglob("*.jpg"))
+            images = sorted(sel_prev.rglob("*.png")) + sorted(sel_prev.rglob("*.jpg"))
             images = [i for i in images if i.stat().st_size > 2048][:80]
 
             if images:
-                st.subheader(f"🖼️ Image Gallery ({len(images)})")
+                st.subheader(f"🖼️ Structure Gallery ({len(images)})")
 
-                # Filter by subfolder
                 subfolders = sorted({i.parent.name for i in images})
                 if len(subfolders) > 1:
                     folder_filter = st.selectbox(
                         "Filter by folder", ["All"] + subfolders, key="img_filter"
                     )
                     if folder_filter != "All":
-                        images = [
-                            i for i in images if i.parent.name == folder_filter]
+                        images = [i for i in images if i.parent.name == folder_filter]
 
                 cols_per_row = st.select_slider(
-                    "Columns", options=[2, 3, 4, 5], value=3, key="img_cols"
+                    "Columns", options=[2, 3, 4, 5], value=4, key="img_cols"
                 )
-                rows = [images[i:i+cols_per_row]
-                        for i in range(0, len(images), cols_per_row)]
+                rows = [images[i:i+cols_per_row] for i in range(0, len(images), cols_per_row)]
                 for row in rows:
                     img_cols = st.columns(cols_per_row)
                     for col, img_path in zip(img_cols, row):
-                        col.image(str(img_path), caption=img_path.name,
-                                  use_container_width=True)
+                        col.image(str(img_path), caption=img_path.stem, use_container_width=True)
 
                 st.divider()
 
@@ -743,8 +1144,7 @@ with tab_preview:
                 + sorted(sel_prev.rglob("*.xlsx"))
                 + sorted(sel_prev.rglob("*.csv"))
             )
-            data_files = [f for f in data_files if f.stat().st_size >
-                          1024][:12]
+            data_files = [f for f in data_files if f.stat().st_size > 1024][:12]
 
             if data_files:
                 st.subheader(f"📋 Data Tables ({len(data_files)})")
@@ -757,14 +1157,12 @@ with tab_preview:
                 if chosen:
                     df_t = _load_df(Path(chosen), nrows=500)
                     if df_t is not None:
-                        st.caption(
-                            f"{len(df_t)} rows × {len(df_t.columns)} columns")
-                        st.dataframe(
-                            df_t, use_container_width=True, height=380)
+                        st.caption(f"{len(df_t)} rows × {len(df_t.columns)} columns")
+                        st.dataframe(df_t, use_container_width=True, height=380)
                     else:
                         st.error("Could not read this file.")
 
-            if not images and chart_df is None and not data_files:
+            if main_df is None and not images and not data_files:
                 st.info("No output files found in this run folder.")
 
 # ── TAB: RESULTS ──────────────────────────────────────────────────────────────
@@ -787,22 +1185,27 @@ with tab_results:
             format_func=lambda d: d.name,
         )
         if selected:
-            files = list_result_files(Path(selected))
+            sel_path = Path(selected)
+            files = list_result_files(sel_path)
             if not files:
                 st.info("Empty folder.")
             else:
-                st.write(f"**{len(files)} file(s) — click to download:**")
-                for fpath in files:
-                    rel = fpath.relative_to(selected)
-                    size_kb = fpath.stat().st_size / 1024
-                    with open(fpath, "rb") as fh:
-                        st.download_button(
-                            label=f"⬇️ {rel}  ({size_kb:,.0f} KB)",
-                            data=fh.read(),
-                            file_name=fpath.name,
-                            key=str(fpath),
-                            use_container_width=True,
-                        )
+                total_mb = sum(f.stat().st_size for f in files) / 1e6
+                st.write(f"**{len(files)} file(s) — {total_mb:.1f} MB total**")
+
+                # Build zip in memory and offer single download
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fpath in files:
+                        zf.write(fpath, fpath.relative_to(sel_path))
+                buf.seek(0)
+                st.download_button(
+                    label=f"⬇️ Download entire folder as ZIP  ({total_mb:.1f} MB)",
+                    data=buf,
+                    file_name=f"{sel_path.name}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
 
 # ── TAB: HELP ─────────────────────────────────────────────────────────────────
 with tab_help:
