@@ -1,24 +1,13 @@
-# ============================================================
-# PART III — FIGURE & STATISTICS (Figure_Statistic_new_v2.R)
-# ------------------------------------------------------------
-# Inputs expected in the Global Env (from Part I):
-#   lin_enriched, uni_enriched, OUT_DIR, base_tag,
-#   TAXON_VALUES, TAXON_MODE, cfg, (optional) map_tax_inchi
-#
-# Reads ALL parameters from `cfg` (see Section [N] of pipeline).
-# Saves figures/tables to OUT_DIR with prefix base_tag.
-# No interactive prompts; robust guards everywhere.
-# ============================================================
+## Part III — figures and statistics
 
-
-## ---------- 0) Packages ----------
+## packages
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(stringr); library(rlang)
   library(ggplot2); library(ggrepel); library(scales); library(forcats)
   library(vegan); library(writexl); library(tibble)
 })
 
-## ---------- 0.1) Helpers ----------
+## helpers
 `%||%` <- function(a,b) if (is.null(a)) b else a
 to_num  <- function(x) suppressWarnings(as.numeric(x))
 nzchar0 <- function(x){ x <- as.character(x); ifelse(is.na(x), FALSE, nzchar(trimws(x))) }
@@ -59,7 +48,7 @@ ensure_tax_col_present <- function(df, tax_col,
 }
 
 
-## ---- Export flags ----
+## export flags
 SHOW_PLOTS       <- isTRUE(cfg$show_plots %||% TRUE)
 SAVE_STATIC_PNGS <- FALSE
 SAVE_STATIC_PDFS <- isTRUE(cfg$save_pdfs %||% TRUE)
@@ -75,7 +64,7 @@ save_plot_multi <- function(plot_obj, file_base, width = 8, height = 12, bg = "w
   if (isTRUE(SHOW_PLOTS)) print(plot_obj)
 }
 
-## ---------- 1) Validate required objects ----------
+## validate env
 need_objs <- c("lin_enriched","uni_enriched","OUT_DIR","base_tag",
                "TAXON_VALUES","TAXON_MODE","cfg")
 miss <- need_objs[!vapply(need_objs, exists, logical(1))]
@@ -83,18 +72,14 @@ if (length(miss)) stop("Missing required objects in Global Env: ",
                        paste(miss, collapse=", "))
 if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-## ---------- 2) Resolve analysis level ----------
-# Prefer cfg$analysis_level or cfg$analysis_tax_level; fallback to TAXON_MODE
 cfg_level_raw  <- cfg$analysis_level %||% cfg$analysis_tax_level
 analysis_level <- tolower(cfg_level_raw %||% TAXON_MODE)
 
-# Allow only species / genus / family; fallback if needed
 if (!analysis_level %in% c("species","genus","family")) {
   analysis_level <- if (identical(TAXON_MODE, "species")) "species" else "genus"
 }
 
-# If analysis_level == "species" but não há nenhuma coluna de espécie utilizável,
-# recua para "genus" para não quebrar.
+# fall back to genus if no usable species column exists
 species_candidates_global <- c("species","accepted_name","species_std","scientificName")
 if (identical(analysis_level, "species") &&
     !any(species_candidates_global %in% names(lin_enriched))) {
@@ -104,7 +89,6 @@ if (identical(analysis_level, "species") &&
 level_internal <- analysis_level
 tax_col        <- analysis_level   # "species" | "genus" | "family"
 
-## ---------- 3) Build scope ----------
 sp_priority <- cfg$species_col_priority %||%
   c("accepted_name","species","species_std","scientificName")
 sp_priority <- unique(c(sp_priority,
@@ -152,7 +136,6 @@ lin_scope <- lin_scope %>%
     )
   )
 
-# -------------------- Helpers (taxon faces) --------------------
 face_for_taxon <- function(tax_col) {
   tc <- tolower(as.character(tax_col %||% "species"))
   if (tc %in% c("genus","species")) "italic" else "plain"
@@ -227,7 +210,6 @@ if (!length(fam_alvo)) {
 }
 fam_label <- paste(fam_alvo, collapse = ", ")
 
-## ---------- 3A) Scope-aware label for figure titles ----------
 scope_label <- (function() {
   mode <- TAXON_MODE
   if (identical(mode, "family")) {
@@ -260,7 +242,6 @@ scope_label <- (function() {
 ## Back-compat: anything still using fam_label_safe will get the scope-aware label
 fam_label_safe <- scope_label
 
-## ---------- 4) Parameters ----------
 min_n_taxon <- as.integer(cfg$analysis_min_compounds_per_taxon %||% 10L)
 TOP_N_TAXA  <- as.integer(cfg$analysis_top_taxa %||% 40L)
 
@@ -298,9 +279,6 @@ DO_PHYSCHEM_VIOLIN    <- isTRUE(cfg$do_physchem_violin %||% TRUE)
 y_face <- if (tax_col %in% c("genus","species")) "italic" else "plain"
 x_face <- y_face
 
-# ------------------------------------------------------------
-# Label helper to standardize figure subtitles/titles
-# ------------------------------------------------------------
 make_label_context <- function(cfg, block_name, distance_used = NULL) {
   strat <- cfg$count_strategy_per_block[[block_name]] %||%
     cfg$count_strategy %||% "unique_per_taxon"
@@ -314,16 +292,7 @@ make_label_context <- function(cfg, block_name, distance_used = NULL) {
   paste0(label, dist_info)
 }
 
-## ---------- 4A) Core tables ----------
-# df_lin: base para contagem de compostos por taxon (nível de análise)
-df_lin <- lin_scope %>%
-  dplyr::filter(!is.na(.data[[tax_col]]),
-                nzchar(as.character(.data[[tax_col]]))) %>%
-  dplyr::distinct(.data[[tax_col]], inchikey)
-
-df_lin <- ensure_tax_col_present(df_lin, tax_col)
-df_lin <- safe_expose_species(df_lin, tax_col)
-
+## core tables
 df_lin <- lin_scope %>%
   dplyr::filter(!is.na(.data[[tax_col]]),
                 nzchar(as.character(.data[[tax_col]]))) %>%
@@ -381,75 +350,46 @@ if (!"taxon" %in% names(map_tax_inchi)) {
     dplyr::mutate(taxon = .data[[tax_col]])
 }
 
-# =====================================================================
-# 1. HYBRID CLASS CREATION (CORRECTED: Semantic Standardization)
-# =====================================================================
+## hybrid class creation
 
-if ("chemicalTaxonomyNPclassifierSuperclass" %in% names(uni_enriched) && 
+if ("chemicalTaxonomyNPclassifierSuperclass" %in% names(uni_enriched) &&
     "chemicalTaxonomyClassyfireClass" %in% names(uni_enriched)) {
-  
-  message(">>> Creating 'hybrid_class' with Semantic Cleaning...")
-  
-  # Helper: Splits pipes/semicolons and takes the first term
-  get_primary_term <- function(x) {
+
+  # vectorized helpers — takes first term before any pipe/semicolon separator
+  get_primary_term_v <- function(x) {
     x <- as.character(x)
-    if (is.na(x) || x == "NA" || x == "") return(NA_character_)
-    x <- gsub("\\|", ";", x) # Standardize separators
-    parts <- unlist(strsplit(x, ";"))
-    parts <- trimws(parts)
-    parts <- parts[nzchar(parts) & parts != "NA"]
-    if (length(parts) > 0) return(parts[1]) else return(NA_character_)
+    x[is.na(x) | x == "NA" | x == ""] <- NA_character_
+    x <- trimws(sub(";.*", "", gsub("\\|", ";", x)))
+    x[!nzchar(x) | x == "NA"] <- NA_character_
+    x
   }
-  
-  # Helper: Semantic Standardization (The "Synonym Dictionary")
-  # Here we fix names that effectively mean the same thing
-  standardize_class <- function(x) {
-    if (is.na(x)) return(NA_character_)
-    
-    # 1. Group Lipids/Fatty Acids under "Fatty acyls"
-    # Catches "Fatty esters", "Fatty Acids", "Fatty Acyls" (case insensitive)
-    if (grepl("Fatty", x, ignore.case = TRUE)) return("Fatty acyls")
-    
-    # 2. Other common fixes (Optional - add more if needed)
-    if (x == "Prenol Lipids") return("Prenol lipids") # Fix capitalization
-    if (grepl("Glycerophospholipids", x)) return("Glycerophospholipids")
-    
-    return(x)
+
+  standardize_class_v <- function(x) {
+    dplyr::case_when(
+      is.na(x)                                    ~ NA_character_,
+      grepl("Fatty", x, ignore.case = TRUE)       ~ "Fatty acyls",
+      x == "Prenol Lipids"                        ~ "Prenol lipids",
+      grepl("Glycerophospholipids", x)            ~ "Glycerophospholipids",
+      TRUE                                        ~ x
+    )
   }
-  
-  # Apply logic in steps (rowwise is safer for custom functions)
+
   uni_enriched <- uni_enriched %>%
-    dplyr::rowwise() %>%
     dplyr::mutate(
-      # Step 1: Get primary term (remove junk after ;)
-      .temp_np = get_primary_term(chemicalTaxonomyNPclassifierSuperclass),
-      .temp_cf = get_primary_term(chemicalTaxonomyClassyfireClass),
-      
-      # Step 2: Choose source (NPClassifier > ClassyFire)
-      .raw_class = dplyr::coalesce(.temp_np, .temp_cf),
-      
-      # Step 3: Standardize synonyms (Apply "Fatty" fix)
-      hybrid_class = standardize_class(.raw_class)
+      .np          = get_primary_term_v(chemicalTaxonomyNPclassifierSuperclass),
+      .cf          = get_primary_term_v(chemicalTaxonomyClassyfireClass),
+      hybrid_class = standardize_class_v(dplyr::coalesce(.np, .cf))
     ) %>%
-    dplyr::ungroup() %>%
-    dplyr::select(-.temp_np, -.temp_cf, -.raw_class)
-  
-  CHEM_COL_ALVO <- "hybrid_class" 
-  
-  # Diagnostic: Check if "Fatty" classes were unified
-  cat("   -> Integrity check (Unified 'Fatty' classes):\n")
-  print(table(grep("Fatty", uni_enriched$hybrid_class, value = TRUE)))
-  
+    dplyr::select(-.np, -.cf)
+
+  CHEM_COL_ALVO <- "hybrid_class"
+
 } else {
-  warning("Columns missing. Using raw ClassyFire.")
+  warning("NPClassifier or ClassyFire column missing — falling back to ClassyFire class.")
   CHEM_COL_ALVO <- "chemicalTaxonomyClassyfireClass"
 }
 
-# =====================================================================
-# 2. COLUMN SELECTION (Now that the column exists)
-# =====================================================================
-
-# ---- df_props: physicochemical properties linked to the analyzed taxon ----
+## column selection
 want_cols <- c(
   "inchikey","molecular_weight","xlogp","topoPSA","fsp3",
   "hBondAcceptorCount","hBondDonorCount",
@@ -484,14 +424,6 @@ df_props <- df_props %>%
   dplyr::filter(!is.na(.data[[tax_col]]),
                 nzchar(as.character(.data[[tax_col]])))
 df_props <- safe_expose_species(df_props, tax_col)
-
-# Quick debug to confirm
-message("Checking columns in df_props: ", paste(names(df_props), collapse=", "))
-if("hybrid_class" %in% names(df_props)) {
-  message("SUCCESS: hybrid_class is present!") 
-} else {
-  message("ERROR: hybrid_class is still missing.")
-}
 
 # ---- pa_mat: matriz presença/ausência taxon × composto (flexível) ----
 pa_mat <- map_tax_inchi %>%
@@ -542,9 +474,7 @@ num_cols_all <- c(
 )
 
 
-# =====================================================================
-# 5) RICHNESS & DIVERSITY — publication-tuned (clean subtitle)
-# =====================================================================
+## richness & diversity
 if (isTRUE(DO_RICHNESS_DIVERSITY) && nrow(pa_mat) > 0 && ncol(pa_mat) > 0) {
   # --- Metrics ---
   richness <- rowSums(pa_mat > 0, na.rm = TRUE)
@@ -618,15 +548,7 @@ if (isTRUE(DO_RICHNESS_DIVERSITY) && nrow(pa_mat) > 0 && ncol(pa_mat) > 0) {
   cat("✔ Saved:", normalizePath(out_stats, winslash = "/"), "\n")
 }
 
-# =====================================================================
-# FLEXIBLE CHEMICAL HEATMAP — Class(yFire) × taxon (family/genus/species)
-# - rows  : ClassyFire Class (or Superclass)
-# - cols  : tax_col ("family", "genus" ou "species") resolvido upstream
-# - value : n_distinct(inchikey) por class × taxon (opcionalmente log1p)
-# - mostra em RStudio Plots E exporta PDF (sem PNG)
-# Requirements: dplyr, tidyr, ComplexHeatmap, circlize, grid, viridisLite
-# Inputs esperados: df_props (já com tax_col), tax_col
-# =====================================================================
+## chemical class heatmap
 
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr)
@@ -795,9 +717,7 @@ make_class_taxon_heatmap <- function(
   invisible(list(pdf = pdf_path, matrix = mat, breaks = brks))
 }
 
-# =====================================================================
-# 6) FLEXIBLE CHEMICAL HEATMAP CALL — Class(yFire) × taxon
-# =====================================================================
+## chemical class heatmap — call
 
 OUT_DIR_SAFE  <- if (exists("OUT_DIR")) OUT_DIR else getwd()
 BASE_TAG_SAFE <- if (exists("base_tag")) base_tag else "lotus_chem"
@@ -808,26 +728,22 @@ if (isTRUE(DO_HEATMAP_QUIMICO)) {
   } else {
     message("Running chemical class heatmap (Hybrid NP/ClassyFire × ", tax_col, ")...")
     
-    # --- TRUQUE: Renomeia 'hybrid_class' para enganar a função antiga ---
     df_plot_input <- df_props
-    
-    # Se a coluna híbrida (CHEM_COL_ALVO) existir, jogamos ela para dentro 
-    # da coluna que a função espera ("chemicalTaxonomyClassyfireClass")
     if (exists("CHEM_COL_ALVO") && CHEM_COL_ALVO %in% names(df_plot_input)) {
       df_plot_input$chemicalTaxonomyClassyfireClass <- df_plot_input[[CHEM_COL_ALVO]]
     }
     
     try({
       hm_res <- make_class_taxon_heatmap(
-        df_props       = df_plot_input,        # <--- Usa o DF modificado
+        df_props       = df_plot_input,
         tax_col        = tax_col,
-        use_superclass = FALSE,                # <--- FALSE para pegar a coluna "Class" (que agora é a híbrida)
+        use_superclass = FALSE,
         log_transform  = TRUE,
         drop_zeros     = TRUE,
         top_n_rows     = NULL,
-        top_n_cols     = heatmap_max_cols,     # Variável definida na seção 4
-        occ_pct_min    = occ_pct_min,          # Variável definida na seção 4
-        n_mols_min     = n_mols_min,           # Variável definida na seção 4
+        top_n_cols     = heatmap_max_cols,
+        occ_pct_min    = occ_pct_min,
+        n_mols_min     = n_mols_min,
         scope_label    = scope_label,
         outdir         = OUT_DIR_SAFE,
         file_prefix    = paste0(BASE_TAG_SAFE, "_chem_heatmap_Hybrid"), # Nome atualizado
@@ -838,29 +754,16 @@ if (isTRUE(DO_HEATMAP_QUIMICO)) {
   }
 } 
 
-# =====================================================================
-# 7) DISTRIBUTION PLOTS (Boxplots & Violins) - COM RAZÃO O/C
-# =====================================================================
+## distribution plots
 
-# 1. CREATE MASTER VISUAL DATAFRAME (Calculando O/C Ratio)
 if (exists("df_props") && exists("taxa_keep")) {
-  message(">>> Creating Unified Visual Dataframe (filtered by taxa_keep)...")
-  
   df_visuals_ready <- df_props %>%
-    # Filter 1: Keep only the Top N taxa identified in Section 4
     dplyr::filter(.data[[tax_col]] %in% taxa_keep) %>%
-    # Filter 2: Ensure valid names
     dplyr::filter(nzchar(as.character(.data[[tax_col]])), !is.na(.data[[tax_col]])) %>%
-    # Helper: Calcular Variáveis Extras
     dplyr::mutate(
-      # Numéricos Seguros
       C_num = to_num(number_of_carbons),
       O_num = to_num(number_of_oxygens),
-      
-      # [NOVO] Cálculo da Razão O/C (Evita divisão por zero)
       OC_Ratio = dplyr::if_else(C_num > 0, O_num / C_num, 0),
-      
-      # Caps para visualização (sem outliers extremos)
       topoPSA_cap = pmin(to_num(topoPSA), CAP_TPSA),
       n_rings_cap = pmin(to_num(max_number_of_rings), CAP_RINGS)
     )
@@ -868,9 +771,6 @@ if (exists("df_props") && exists("taxa_keep")) {
   stop("Critical Error: 'df_props' or 'taxa_keep' missing. Run Section 4 first.")
 }
 
-# ---------------------------------------------------------------------
-# 7.G) GENERIC BOXPLOT FUNCTION
-# ---------------------------------------------------------------------
 plot_box <- function(df_source, var, label = NULL, use_cap = FALSE) {
   v <- if (use_cap) paste0(var, "_cap") else var
   if (!v %in% names(df_source)) { return(invisible(NULL)) }
@@ -909,24 +809,18 @@ plot_box <- function(df_source, var, label = NULL, use_cap = FALSE) {
   save_plot_multi(p, fn, width = 8, height = max(6, length(unique(d[[tax_col]]))*0.2))
 }
 
-# --- EXECUTE BOXPLOTS (Adicionei o boxplot de O/C também!) ---
 if (isTRUE(DO_BOX_PROPS)) {
-  message("-> Generating Boxplots (Mean-sorted)...")
   plot_box(df_visuals_ready, "molecular_weight", "Molecular Weight")
   plot_box(df_visuals_ready, "xlogp", "xLogP")
   plot_box(df_visuals_ready, "topoPSA", "Topological PSA", use_cap = TRUE)
   plot_box(df_visuals_ready, "fsp3", "Fsp3 (Complexity)")
-  plot_box(df_visuals_ready, "OC_Ratio", "O/C Ratio (Oxidation)") # <--- NOVO
+  plot_box(df_visuals_ready, "OC_Ratio", "O/C Ratio (Oxidation)")
 }
 
 
-# =====================================================================
-# 7bis) VIOLIN PLOTS (Multi-Panel) - INCLUINDO O/C RATIO
-# =====================================================================
+## violin plots
+
 if (isTRUE(DO_PHYSCHEM_VIOLIN)) {
-  message("-> Generating Violin Plots (Including O/C Ratio)...")
-  
-  # [ATUALIZADO] Lista de variáveis para o violino
   v_list <- c("molecular_weight", "xlogp", "topoPSA", "fsp3", "OC_Ratio", "hBondDonorCount")
   v_labs <- c("MW", "xLogP", "TPSA", "Fsp3", "O/C Ratio", "HBD")
   
@@ -985,9 +879,7 @@ if (isTRUE(DO_PHYSCHEM_VIOLIN)) {
   }
 }
 
-# =====================================================================
-# 7bis) PHYSICOCHEMICAL HEATMAP — ComplexHeatmap version
-# =====================================================================
+## physicochemical heatmap
 if (isTRUE(DO_PHYSCHEM_HEATMAP)) {
   needed <- c("df_props", "tax_col", "OUT_DIR", "base_tag")
   miss   <- needed[!vapply(needed, exists, logical(1))]
@@ -1124,12 +1016,9 @@ if (isTRUE(DO_PHYSCHEM_HEATMAP)) {
 
 
 
-# =====================================================================
-# 8) LIPINSKI & SUGARS
-# =====================================================================
+## lipinski & sugars
+
 if (isTRUE(DO_LIPINSKI_SUGAR)) {
-  
-  # ---------- 8.A) Helpers locais ----------
   as_bool <- function(x) {
     if (is.null(x)) return(logical(0))
     if (is.logical(x)) return(x)
@@ -1174,7 +1063,6 @@ if (isTRUE(DO_LIPINSKI_SUGAR)) {
     base_df
   }
   
-  # ---------- 8.B) Base de dados: df_props + taxon ----------
   base0 <- df_props %>%
     dplyr::inner_join(
       dplyr::select(map_tax_inchi, inchikey, !!rlang::sym(tax_col)),
@@ -1206,7 +1094,6 @@ if (isTRUE(DO_LIPINSKI_SUGAR)) {
     derive_any_sugar() %>%
     { safe_expose_species(., tax_col) }
   
-  # ---------- 8.C) Tabela resumo por taxon ----------
   base0_filt <- base0 %>%
     dplyr::filter(!is.na(.data[[tax_col]]), nzchar(.data[[tax_col]]))
   
@@ -1223,7 +1110,6 @@ if (isTRUE(DO_LIPINSKI_SUGAR)) {
   
   print(tab)
   
-  # ---------- 8.D) Lipinski: gráfico empilhado por taxon ----------
   lip_long <- base0_filt %>%
     dplyr::filter(!is.na(Lipinski)) %>%
     dplyr::count(!!rlang::sym(tax_col), Lipinski, name = "n") %>%
@@ -1286,7 +1172,6 @@ if (isTRUE(DO_LIPINSKI_SUGAR)) {
     )
   }
   
-  # ---------- 8.E) Glycosides: gráfico empilhado por taxon ----------
   sugar_long <- base0_filt %>%
     dplyr::mutate(
       sugar_lbl = dplyr::case_when(
@@ -1359,7 +1244,6 @@ if (isTRUE(DO_LIPINSKI_SUGAR)) {
     )
   }
   
-  # ---------- 8.F) Export resumo ----------
   out_lip <- file.path(OUT_DIR, paste0(base_tag, "_lipinski_sugars_summary.xlsx"))
   writexl::write_xlsx(
     list(summary_by_taxon = tab),
@@ -1368,12 +1252,8 @@ if (isTRUE(DO_LIPINSKI_SUGAR)) {
   cat("✔ Saved:", normalizePath(out_lip, winslash = "/"), "\n")
 }
 
-# =====================================================================
-# 9) ELEMENTAL RATIOS (O/C) — Adjusted for Hybrid Class
-# =====================================================================
+## elemental ratios
 if (isTRUE(DO_ELEM_RATIOS)) {
-  
-  # --- CORREÇÃO: Usa a coluna híbrida dinâmica se ela existir ---
   if (exists("CHEM_COL_ALVO") && CHEM_COL_ALVO %in% names(uni_enriched)) {
     eixo_tax <- CHEM_COL_ALVO
     eixo_label <- "Chemical Class (Hybrid: NPClassifier > ClassyFire)"
@@ -1382,9 +1262,6 @@ if (isTRUE(DO_ELEM_RATIOS)) {
     eixo_label <- "Class (ClassyFire)"
   }
   
-  message("Elemental Ratios (O/C) using axis: ", eixo_tax)
-  
-  # ---------- 9.A) O/C by taxon (Esse bloco já estava ok) ----------
   elem <- uni_enriched %>%
     dplyr::select(inchikey, number_of_carbons, number_of_oxygens) %>%
     dplyr::mutate(
@@ -1402,18 +1279,15 @@ if (isTRUE(DO_ELEM_RATIOS)) {
     )
   
   if (nrow(elem)) {
-    # ... (código do plot por taxon permanece igual, omitido aqui para brevidade) ...
     d_tax <- elem %>%
       dplyr::group_by(.data[[tax_col]]) %>%
       dplyr::filter(dplyr::n() >= min_n_taxon) %>%
       dplyr::ungroup()
     
     if (nrow(d_tax)) {
-      # Plot 9.A code... (sem alterações necessárias no plot por táxon)
       sub_lab <- make_label_context(cfg, "oc_taxon")
       y_face  <- face_for_taxon(tax_col)
       
-      # (Recriando o plot 9.A rapidamente para garantir integridade)
       p_oc_taxon <- ggplot(d_tax, aes(x = reorder(.data[[tax_col]], OC_cap, FUN = median, na.rm = TRUE), y = OC_cap)) +
         geom_boxplot(outlier.alpha = .25, width = .6, color = "black", fill = "white", linewidth = .5) +
         stat_summary(fun = median, geom = "point", size = 1.8, color = "black") +
@@ -1428,8 +1302,6 @@ if (isTRUE(DO_ELEM_RATIOS)) {
     }
   }
   
-  # ---------- 9.B) O/C by chemical class (AQUI ESTAVA O ERRO) ----------
-  # Verifica se a coluna alvo existe em uni_enriched
   if (eixo_tax %in% names(uni_enriched)) {
     
     chem_elem <- uni_enriched %>%
@@ -1452,7 +1324,6 @@ if (isTRUE(DO_ELEM_RATIOS)) {
       )
     
     if (nrow(chem_elem)) {
-      # Filtros de ocorrência
       present_tab <- chem_elem %>%
         dplyr::distinct(.data[[tax_col]], .data[[eixo_tax]]) %>%
         dplyr::count(.data[[eixo_tax]], name = "n_tax_present")
@@ -1473,7 +1344,6 @@ if (isTRUE(DO_ELEM_RATIOS)) {
         dplyr::filter(.data[[eixo_tax]] %in% intersect(keep_occ, keep_mols))
       
       if (nrow(chem_elem_f)) {
-        # Ordenação
         order_classes <- chem_elem_f %>%
           dplyr::group_by(.data[[eixo_tax]]) %>%
           dplyr::summarise(OC_med = median(OC, na.rm = TRUE), .groups = "drop") %>%
@@ -1496,7 +1366,7 @@ if (isTRUE(DO_ELEM_RATIOS)) {
           geom_jitter(width = .12, alpha = .20, size = .8, color = "grey35") +
           coord_flip() +
           labs(
-            x = eixo_label,   # <--- Label Dinâmico
+            x = eixo_label,
             y = "O/C (cap=1.20)",
             title    = paste0("O/C by class — ", scope_label),
             subtitle = sub_lab
@@ -1515,9 +1385,7 @@ if (isTRUE(DO_ELEM_RATIOS)) {
   }
 }
 
-# =====================================================================
-# 10) MURCKO frameworks (Excel + stacked bar preview)
-# =====================================================================
+## murcko frameworks
 if (isTRUE(DO_MURCKO)) {
   if (!requireNamespace("ChemmineR", quietly = TRUE)) {
     message("Murcko skipped (ChemmineR not installed).")
@@ -1529,7 +1397,6 @@ if (isTRUE(DO_MURCKO)) {
     MW_MIN <- as.numeric(cfg$murcko_min_fragment_mw %||% 200)
     TOPK   <- as.integer(cfg$murcko_top_k %||% 15)
     
-    # ---------- 10.A) Funções auxiliares (MW a partir de SMILES) ----------
     safe_sdf_from_smiles <- function(sm) {
       if (is.null(sm) || !nzchar(sm)) return(NULL)
       
@@ -1538,7 +1405,6 @@ if (isTRUE(DO_MURCKO)) {
         silent = TRUE
       )
       if (!inherits(s1, "try-error") && length(s1) >= 1) {
-        # devolver diretamente o SDFset
         return(s1)
       }
       
@@ -1560,7 +1426,6 @@ if (isTRUE(DO_MURCKO)) {
       as.numeric(ChemmineR::MW(sdfset))[1]
     }
     
-    # ---------- 10.B) Base: frameworks × taxon ----------
     base_fw <- df_props %>%
       dplyr::inner_join(
         dplyr::select(
@@ -1580,7 +1445,6 @@ if (isTRUE(DO_MURCKO)) {
     if (!nrow(base_fw)) {
       message("Murcko: no frameworks after filters.")
     } else {
-      # ---------- 10.C) Frameworks únicos + MW do fragmento ----------
       uniq_fw <- dplyr::distinct(base_fw, murko_framework)
       
       uniq_fw$mw_fragment <- vapply(
@@ -1602,7 +1466,6 @@ if (isTRUE(DO_MURCKO)) {
           MW_MIN
         ))
       } else {
-        # ---------- 10.D) Contagens por taxon + ranking ----------
         mf_long <- base_fw %>%
           dplyr::semi_join(uniq_fw_f, by = "murko_framework") %>%
           dplyr::count(murko_framework, taxon_plot, name = "n")
@@ -1618,7 +1481,6 @@ if (isTRUE(DO_MURCKO)) {
         
         TOPK_EFF <- min(TOPK, nrow(mf_total))
         
-        # -------------------- Rank table (Top K effective) --------------------
         if (exists("mf_total") && nrow(mf_total) > 0) {
           n_avail_rank <- nrow(mf_total)
           n_show_rank  <- min(TOPK_EFF, n_avail_rank)
@@ -1630,7 +1492,6 @@ if (isTRUE(DO_MURCKO)) {
           rank_tbl <- tibble::tibble()
         }
         
-        # ---------- 10.E) Excel: frameworks + contagens por taxon ----------
         xls_fw <- rank_tbl %>%
           dplyr::select(
             rank, murko_framework, mw_fragment, total
@@ -1659,7 +1520,6 @@ if (isTRUE(DO_MURCKO)) {
         message("✔ Murcko Excel saved at: ",
                 normalizePath(xls_path, winslash = "/"))
         
-        # ---------- 10.F) Gráfico de preview (stacked bar) ----------
         plot_df <- rank_tbl %>%
           dplyr::left_join(mf_long, by = "murko_framework") %>%
           dplyr::mutate(
@@ -1705,12 +1565,8 @@ if (isTRUE(DO_MURCKO)) {
   }
 }
 
-# =====================================================================
-# 11) SHARED COMPOUNDS — taxa-level (family / genus / species)
-# =====================================================================
+## shared compounds
 if (isTRUE(DO_SHARED_COMPOUNDS)) {
-  
-  # ---------- 11.A) Minimal guards ----------
   req_objs <- c("map_tax_inchi", "uni_enriched", "OUT_DIR", "base_tag", "tax_col")
   miss     <- req_objs[!vapply(req_objs, exists, logical(1))]
   if (length(miss)) {
@@ -1736,7 +1592,6 @@ if (isTRUE(DO_SHARED_COMPOUNDS)) {
     enc2utf8(x)
   }
   
-  # ---------- 11.B) Cruzamento inchikey × taxa ----------
   cross <- map_tax_inchi %>%
     dplyr::filter(!is.na(.data[[tax_col]]), nzchar(.data[[tax_col]])) %>%
     dplyr::group_by(inchikey) %>%
@@ -1757,7 +1612,6 @@ if (isTRUE(DO_SHARED_COMPOUNDS)) {
       by = "inchikey"
     )
   
-  # só nos interessam compostos presentes em ≥2 taxa
   cross_shared <- cross %>%
     dplyr::filter(n_taxa >= 2)
   
@@ -1766,7 +1620,6 @@ if (isTRUE(DO_SHARED_COMPOUNDS)) {
             tax_col, "'.")
   } else {
     
-    # ---------- 11.C) Tabela wide (uma linha por composto) ----------
     resumo_wide <- cross_shared %>%
       dplyr::transmute(
         inchikey,
@@ -1787,7 +1640,6 @@ if (isTRUE(DO_SHARED_COMPOUNDS)) {
       ) %>%
       dplyr::mutate(taxa = trim_cell(taxa))
     
-    # ---------- 11.D) Tabela long (uma linha por composto × taxon) ----------
     resumo_long <- cross_shared %>%
       tidyr::unnest_longer(taxa) %>%
       dplyr::rename(taxon = taxa) %>%
@@ -1799,7 +1651,6 @@ if (isTRUE(DO_SHARED_COMPOUNDS)) {
         taxon_level      = tax_col
       )
     
-    # ---------- 11.E) Export Excel ----------
     out_xlsx <- file.path(OUT_DIR, paste0(base_tag, "_shared_compounds.xlsx"))
     writexl::write_xlsx(
       list(
@@ -1810,18 +1661,12 @@ if (isTRUE(DO_SHARED_COMPOUNDS)) {
     )
     cat("✔ Saved:", normalizePath(out_xlsx, winslash = "/"), "\n")
     
-    # pequeno preview no console
-    message("Shared compounds (first 20):")
     print(utils::head(resumo_wide, 20))
   }
 }
 
-# =====================================================================
-# 12) BIBLIOMETRICS — using ref_id as DOI (with clickable links)
-# =====================================================================
+## bibliometrics
 if (isTRUE(DO_BIBLIOMETRICS)) {
-  
-  # ---------- 12.A) Guards ----------
   req_objs <- c("lin_enriched", "uni_enriched", "map_tax_inchi",
                 "OUT_DIR", "base_tag", "tax_col")
   miss <- req_objs[!vapply(req_objs, exists, logical(1))]
@@ -1832,7 +1677,6 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
   if (!"ref_id" %in% names(lin_enriched))
     stop("Block 12: column 'ref_id' (DOI) not found in lin_enriched.")
   
-  # ---------- 12.B) Helper functions ----------
   clean_doi <- function(x) {
     x <- trimws(as.character(x))
     x <- gsub("^(https?://(dx\\.)?doi\\.org/|doi:)", "", x, ignore.case = TRUE)
@@ -1852,13 +1696,11 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
            NA_character_)
   }
   
-  # ---------- 12.C) Universo total ----------
   comp_tax_total <- map_tax_inchi %>%
     normalize_taxcol(tax_col = tax_col) %>%
     dplyr::filter(!is.na(.data[[tax_col]]), nzchar(.data[[tax_col]])) %>%
     dplyr::distinct(!!rlang::sym(tax_col), inchikey)
   
-  # ---------- 12.D) Compostos com DOI ----------
   biblio_tax_comp_ref <- lin_enriched %>%
     dplyr::filter(!is.na(inchikey), nzchar(inchikey),
                   !is.na(ref_id),    nzchar0(ref_id)) %>%
@@ -1877,7 +1719,6 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
     dplyr::distinct(!!rlang::sym(tax_col), inchikey, ref_id) %>%
     dplyr::mutate(doi_url = doi_to_url(ref_id))
   
-  # ---------- 12.E) Resumo por taxon ----------
   resumo_taxon <- comp_tax_total %>%
     dplyr::group_by(!!rlang::sym(tax_col)) %>%
     dplyr::summarise(n_compounds = dplyr::n_distinct(inchikey), .groups = "drop") %>%
@@ -1901,7 +1742,6 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
     ) %>%
     dplyr::arrange(dplyr::desc(n_compounds))
   
-  # ---------- 12.F) Compostos com DOI ----------
   comp_with_ref <- biblio_tax_comp_ref %>%
     dplyr::group_by(!!rlang::sym(tax_col), inchikey) %>%
     dplyr::summarise(
@@ -1923,7 +1763,6 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
     ) %>%
     dplyr::arrange(!!rlang::sym(tax_col), inchikey)
   
-  # ---------- 12.G) Compostos sem DOI ----------
   comp_without_ref <- comp_tax_total %>%
     dplyr::anti_join(
       biblio_tax_comp_ref %>% dplyr::distinct(!!rlang::sym(tax_col), inchikey),
@@ -1937,7 +1776,6 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
     ) %>%
     dplyr::mutate(taxon_level = tax_col)
   
-  # ---------- 12.H) Export ----------
   out_xlsx_bib <- file.path(OUT_DIR, paste0(base_tag, "_bibliometrics.xlsx"))
   writexl::write_xlsx(
     list(
@@ -1949,14 +1787,11 @@ if (isTRUE(DO_BIBLIOMETRICS)) {
   )
   
   cat("✔ Saved:", normalizePath(out_xlsx_bib, winslash = "/"), "\n")
-  message("Bibliometrics (DOI-based) — preview (first 20 taxa):")
   print(utils::head(resumo_taxon, 20))
 }
 
 
-# =====================================================================
-# 13) PCA BIPLOT – Chemical Classes (FIXED: Vector Labels Visible)
-# =====================================================================
+## pca biplot
 if (!exists("DO_PCA_PROPS")) DO_PCA_PROPS <- TRUE
 
 if (isTRUE(DO_PCA_PROPS)) {
@@ -1965,23 +1800,18 @@ if (isTRUE(DO_PCA_PROPS)) {
     library(stringr); library(tibble); library(grid)
   })
   
-  # ---------- 13.A) Basic Guards ----------
   req_objs <- c("lin_enriched", "uni_enriched", "cfg", "OUT_DIR", "base_tag", "scope_label")
   miss <- req_objs[!vapply(req_objs, exists, logical(1))]
   if (length(miss)) stop("PCA classes: missing objects: ", paste(miss, collapse = ", "))
   
-  # Fix PDF Device
   pdf_device <- grDevices::pdf
   if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
   
-  # ---------- 13.B) Taxonomic Level ----------
   if (!exists("tax_col")) {
     tax_col <- tolower(cfg$analysis_tax_level %||% cfg$taxon_mode %||% "species")
   }
   tax_col <- tolower(tax_col)
   
-  # --- LÓGICA DE COR (Solicitação do Usuário) ---
-  # A cor segue estritamente o nível analisado (Species->Species, Genus->Genus)
   group_by_var <- tax_col
   
   label_face <- face_for_taxon(tax_col)
@@ -1989,7 +1819,6 @@ if (isTRUE(DO_PCA_PROPS)) {
   if ("accepted_name" %in% names(lin_enriched)) spec_label <- lin_enriched$accepted_name
   if (all(is.na(spec_label)) && "species" %in% names(lin_enriched)) spec_label <- lin_enriched$species
   
-  # ---------- 13.C) FORCE SYNC & CLEAN Chemical Axis ----------
   clean_pca_class <- function(x) {
     x <- as.character(x)
     x <- sub("\\|.*", "", x) 
@@ -2008,15 +1837,13 @@ if (isTRUE(DO_PCA_PROPS)) {
   }
   lin_enriched[[axis_col]] <- clean_pca_class(lin_enriched[[axis_col]])
   
-  # ---------- 13.D) Parameters ----------
   MIN_N_COMPOUNDS <- as.integer(cfg$pca_classes_min_compounds_per_taxon %||% 30L)
   TOP_LOADINGS    <- as.integer(cfg$pca_classes_top_loadings %||% 12L)
   POINT_ALPHA     <- 0.8
   POINT_SIZE      <- 2.5 
   LABEL_SIZE_TAX  <- 3.0
-  LABEL_SIZE_VAR  <- 3.5 # Aumentei um pouco o texto dos vetores
+  LABEL_SIZE_VAR  <- 3.5
   
-  # ---------- 13.E) Prepare Long Table ----------
   lin_use <- lin_enriched %>%
     dplyr::mutate(
       taxon = dplyr::case_when(
@@ -2028,7 +1855,6 @@ if (isTRUE(DO_PCA_PROPS)) {
     ) %>%
     dplyr::filter(!is.na(taxon), nzchar(taxon), !is.na(.data[[axis_col]]), nzchar(.data[[axis_col]]))
   
-  # Filter Taxa
   keep_taxa <- lin_use %>%
     dplyr::count(taxon, name="n") %>%
     dplyr::filter(n >= MIN_N_COMPOUNDS) %>%
@@ -2037,7 +1863,6 @@ if (isTRUE(DO_PCA_PROPS)) {
   lin_use <- lin_use %>% dplyr::filter(taxon %in% keep_taxa)
   
   if (nrow(lin_use) > 0) {
-    # ---------- 13.F) PCA Calc ----------
     tbl <- lin_use %>%
       dplyr::group_by(taxon, !!rlang::sym(axis_col)) %>%
       dplyr::summarise(n = dplyr::n_distinct(inchikey), .groups = "drop") %>%
@@ -2061,14 +1886,12 @@ if (isTRUE(DO_PCA_PROPS)) {
       
       arr_df <- loadings %>% arrange(desc(mag)) %>% slice_head(n = TOP_LOADINGS)
       
-      # Scale Arrows
       mult <- min(
         (max(scores_df$PC1) - min(scores_df$PC1))/(max(arr_df$PC1)-min(arr_df$PC1)),
         (max(scores_df$PC2) - min(scores_df$PC2))/(max(arr_df$PC2)-min(arr_df$PC2))
       ) * 0.85
       arr_df <- arr_df %>% mutate(xend = PC1 * mult, yend = PC2 * mult)
       
-      # Metadata Join
       scores_grp <- scores_df %>%
         dplyr::left_join(lin_use %>% dplyr::distinct(taxon, !!rlang::sym(group_by_var)), by="taxon")
       
@@ -2077,7 +1900,6 @@ if (isTRUE(DO_PCA_PROPS)) {
         else scores_grp[[group_by_var]] <- "Unknown"
       }
       
-      # Paleta Dinâmica
       n_groups <- length(unique(scores_grp[[group_by_var]]))
       if (n_groups <= 12) {
         pal_ok <- c("#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E",
@@ -2087,21 +1909,17 @@ if (isTRUE(DO_PCA_PROPS)) {
         scale_col_layer <- scale_color_discrete() 
       }
       
-      # Limits
       limx <- max(abs(range(scores_df$PC1))) * 1.15
       limy <- max(abs(range(scores_df$PC2))) * 1.15
       
-      # --- PLOT 1: CLEAN (No Taxon Labels) ---
       p_clean <- ggplot(scores_grp, aes(PC1, PC2, color = .data[[group_by_var]])) +
         geom_hline(yintercept=0, linetype="dotted", color="gray") +
         geom_vline(xintercept=0, linetype="dotted", color="gray") +
         geom_point(alpha = POINT_ALPHA, size = POINT_SIZE) +
         
-        # Arrows (Vetores)
         geom_segment(data = arr_df, aes(x=0, y=0, xend=xend, yend=yend), 
                      inherit.aes=FALSE, arrow=arrow(length=unit(0.2,"cm")), color="black", alpha=0.7) +
         
-        # Arrow Labels (Nomes dos Vetores - FORÇADO A APARECER)
         ggrepel::geom_text_repel(
           data = arr_df, 
           aes(x=xend, y=yend, label=class), 
@@ -2109,8 +1927,8 @@ if (isTRUE(DO_PCA_PROPS)) {
           size=LABEL_SIZE_VAR, 
           fontface="bold", 
           color="black",
-          max.overlaps = Inf,      # <--- FORÇA O RÓTULO A APARECER
-          min.segment.length = 0,  # <--- DESENHA A LINHA SE AFASTADO
+          max.overlaps = Inf,
+          min.segment.length = 0,
           box.padding = 0.5
         ) +
         
@@ -2124,17 +1942,15 @@ if (isTRUE(DO_PCA_PROPS)) {
         theme_classic(base_size = 12) +
         coord_cartesian(xlim = c(-limx, limx), ylim = c(-limy, limy))
       
-      # --- PLOT 2: LABELED (With Taxon Names) ---
       p_labeled <- p_clean +
         labs(title = paste0("PCA (Labeled): ", title_ctx, " — ", scope_label)) +
         ggrepel::geom_text_repel(aes(label=taxon), size=LABEL_SIZE_TAX, fontface=label_face, 
                                  max.overlaps=25, show.legend=FALSE)
       
-      # --- SAVE FILES ---
       fn_clean <- file.path(OUT_DIR, paste0(base_tag, "_PCA_CLEAN.pdf"))
       fn_label <- file.path(OUT_DIR, paste0(base_tag, "_PCA_LABELED.pdf"))
       
-      pdf_device(fn_clean, width=11, height=9); print(p_clean); dev.off() # Aumentei um pouco a largura
+      pdf_device(fn_clean, width=11, height=9); print(p_clean); dev.off()
       pdf_device(fn_label, width=11, height=9); print(p_labeled); dev.off()
       
       message("Saved PCA (Clean): ", fn_clean)
@@ -2143,9 +1959,7 @@ if (isTRUE(DO_PCA_PROPS)) {
   }
 }
 
-# ==========================================================
-# Part III — PCoA FLEX (HARDENED v4: Function Fix)
-# ==========================================================
+## pcoa
 
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(stringr)
@@ -2156,10 +1970,8 @@ DO_PCOA <- isTRUE(cfg$do_pcoa %||% TRUE)
 
 if (isTRUE(DO_PCOA)) {
   
-  # --- 0) DEFINIÇÃO DE FUNÇÕES AUXILIARES (O ERRO ESTAVA AQUI) ---
   trySuppress <- function(expr) suppressWarnings(suppressMessages(try(expr, silent = TRUE)))
   
-  # -------------------- 1) FORCE SETUP --------------------
   target_level <- tolower(cfg$analysis_tax_level %||% cfg$taxon_mode %||% "genus")
   
   if (!target_level %in% names(lin_enriched)) {
@@ -2170,19 +1982,13 @@ if (isTRUE(DO_PCOA)) {
   }
   
   tax_col <- target_level
-  message("------------------------------------------------")
-  message("[PCoA] ANALYSIS LEVEL: ", toupper(tax_col))
-  message("------------------------------------------------")
-  
-  # --- Cleaning Helper ---
+
   clean_pcoa_class <- function(x) {
     x <- as.character(x); x <- sub("\\|.*", "", x); trimws(x)
   }
   
-  # --- Sync Hybrid Class ---
   if (exists("CHEM_COL_ALVO") && CHEM_COL_ALVO %in% names(uni_enriched)) {
     if (!CHEM_COL_ALVO %in% names(lin_enriched)) {
-      message("[PCoA] Syncing hybrid column '", CHEM_COL_ALVO, "'...")
       lin_enriched <- lin_enriched %>%
         dplyr::left_join(uni_enriched %>% dplyr::select(inchikey, !!rlang::sym(CHEM_COL_ALVO)), by = "inchikey")
     }
@@ -2194,9 +2000,7 @@ if (isTRUE(DO_PCOA)) {
   if(CHEM_AXIS_PCOA %in% names(lin_enriched)) {
     lin_enriched[[CHEM_AXIS_PCOA]] <- clean_pcoa_class(lin_enriched[[CHEM_AXIS_PCOA]])
   }
-  message("[PCoA] Chemical Axis: ", CHEM_AXIS_PCOA)
-  
-  # Settings
+
   PCOA_DIST       <- tolower(cfg$pcoa_dist %||% "jaccard")  
   PCOA_BINARY     <- isTRUE(cfg$pcoa_binary %||% TRUE)
   PCOA_MIN_TAX_N  <- as.integer(cfg$pcoa_min_tax_n %||% 3L) 
@@ -2207,7 +2011,6 @@ if (isTRUE(DO_PCOA)) {
   
   if (!exists("OUT_DIR")) OUT_DIR <- getwd()
   
-  # -------------------- 2) Build Map & Matrix --------------------
   build_map_pcoa <- function(lin_tbl, tax_c, keep_g){
     if (!tax_c %in% names(lin_tbl)) stop("[PCoA Error] Column '", tax_c, "' missing.")
     
@@ -2235,7 +2038,6 @@ if (isTRUE(DO_PCOA)) {
     warning("[PCoA] No data available for level: ", tax_col)
   } else {
     
-    # Construção Segura da Matriz
     pa_mat_raw <- tryCatch({
       xtabs(~ tax_key + inchikey, data = map_tax_inchi_pcoa)
     }, error = function(e) NULL)
@@ -2248,7 +2050,6 @@ if (isTRUE(DO_PCOA)) {
       pa_mat[pa_mat > 0] <- 1
       storage.mode(pa_mat) <- "double"
       
-      # Pruning Seguro
       if (nrow(pa_mat) > 0) {
         keep_rows <- rowSums(pa_mat) >= PCOA_MIN_TAX_N
         pa_mat <- pa_mat[keep_rows, , drop=FALSE]
@@ -2259,10 +2060,8 @@ if (isTRUE(DO_PCOA)) {
         warning(paste0("[PCoA] Matrix too small (Rows=", nrow(pa_mat), "). Need >= 3 taxa. Reduce 'analysis_min_compounds'."))
       } else {
         
-        # -------------------- 3) Calc Distance & PCoA --------------------
         d_obj <- trySuppress(vegan::vegdist(pa_mat, method=PCOA_DIST, binary=PCOA_BINARY))
         
-        # Se falhou ou retornou erro
         if (inherits(d_obj, "try-error") || is.null(d_obj) || any(is.na(d_obj))) {
           message("[PCoA] Jaccard failed/NA. Trying Bray-Curtis...")
           d_obj <- trySuppress(vegan::vegdist(pa_mat, method="bray", binary=PCOA_BINARY))
@@ -2275,7 +2074,6 @@ if (isTRUE(DO_PCOA)) {
           scores <- as.data.frame(cmd$points); colnames(scores) <- c("PCoA1","PCoA2")
           scores$tax_key <- rownames(scores)
           
-          # Metadata Merge
           meta_cols <- intersect(c("family", "genus", "species"), names(map_tax_inchi_pcoa))
           ref_table <- map_tax_inchi_pcoa %>% 
             dplyr::select(tax_key, dplyr::all_of(meta_cols)) %>% 
@@ -2287,7 +2085,6 @@ if (isTRUE(DO_PCOA)) {
           # Color Logic
           lbl_col <- if (tax_col == "species" && "genus" %in% names(df_plot)) "genus" else tax_col
           
-          # -------------------- 4) ENVFITS --------------------
           # Classes
           sig_vecs_chem <- NULL
           if ("chem_class" %in% names(map_tax_inchi_pcoa)) {
@@ -2317,7 +2114,6 @@ if (isTRUE(DO_PCOA)) {
             }
           }
           
-          # -------------------- 5) PLOTTING --------------------
           make_pcoa_plot <- function(data_pts, vectors, title_suffix, vec_color, file_suffix) {
             
             lim_xy <- max(max(abs(data_pts$PCoA1)), max(abs(data_pts$PCoA2))) * 1.2
@@ -2359,7 +2155,6 @@ if (isTRUE(DO_PCOA)) {
             message("Saved PCoA set: ", file_suffix)
           }
           
-          # Executar Plots
           if (!is.null(sig_vecs_chem)) {
             make_pcoa_plot(df_plot, sig_vecs_chem, "(Hybrid Class Vectors)", "black", "ChemClassVectors")
           } else {
@@ -2378,55 +2173,37 @@ if (isTRUE(DO_PCOA)) {
 }
 
 
-# =====================================================================
-# PART IV — STATISTICAL SUITE (JNP REQUIREMENT)
-# Automated tests for Physicochemical Properties & Chemical Enrichment
-# =====================================================================
-
+## statistical suite
 if (isTRUE(cfg$run_module3)) {
-  
-  message("\n>>> STARTING PART IV: STATISTICAL SUITE...")
-  
-  # ---------- 1. DATA PREPARATION ----------
-  
-  # Define base dataframe (using df_props generated in Part III)
+  cat("Running statistical suite...\n")
+
   if (!exists("df_props") || nrow(df_props) == 0) {
     stop("df_props not found. Please run Part III sections before Part IV.")
   }
   
-  # Ensure variables are calculated and numeric
   df_stat_base <- df_props %>%
     dplyr::mutate(
       number_of_carbons   = to_num(number_of_carbons),
       number_of_oxygens   = to_num(number_of_oxygens),
-      # Calculate O/C Ratio (Oxidation state proxy)
-      OC_Ratio = dplyr::if_else(number_of_carbons > 0, 
+      OC_Ratio = dplyr::if_else(number_of_carbons > 0,
                                 number_of_oxygens / number_of_carbons, NA_real_),
-      # Ensure numerics
       molecular_weight = to_num(molecular_weight),
       xlogp            = to_num(xlogp),
       topoPSA          = to_num(topoPSA),
       fsp3             = to_num(fsp3),
-      n_rings          = to_num(max_number_of_rings) # Use max rings as proxy
+      n_rings          = to_num(max_number_of_rings)
     )
   
-  # Define variables to test
   vars_to_test <- c("molecular_weight", "xlogp", "topoPSA", "fsp3", 
                     "n_rings", "OC_Ratio", "hBondDonorCount", "hBondAcceptorCount")
   vars_to_test <- intersect(vars_to_test, names(df_stat_base))
   
-  # Filter only Top N taxa (to avoid groups with n=1 skewing statistics)
   taxa_validos <- if (exists("taxa_keep")) taxa_keep else unique(df_stat_base[[tax_col]])
   
   df_stat_clean <- df_stat_base %>%
     dplyr::filter(.data[[tax_col]] %in% taxa_validos) %>%
     dplyr::mutate(Group = as.factor(.data[[tax_col]]))
   
-  
-  # ---------- 2. PHYSICOCHEMICAL STATISTICS (Kruskal-Wallis) ----------
-  # We use Kruskal-Wallis because chemical properties often do NOT follow a normal distribution.
-  
-  message("   -> Running Physicochemical Tests (Kruskal-Wallis + Pairwise Wilcox)...")
   
   stats_summary_list <- list()
   stats_pairwise_list <- list()
@@ -2438,11 +2215,8 @@ if (isTRUE(cfg$run_module3)) {
       tidyr::drop_na()
     
     if (nrow(curr_data) > 0 && length(unique(curr_data$Group)) > 1) {
-      
-      # A) Global Test (Is there a difference?)
       kw_test <- kruskal.test(Value ~ Group, data = curr_data)
       
-      # B) Descriptive Summary
       desc <- curr_data %>%
         dplyr::group_by(Group) %>%
         dplyr::summarise(
@@ -2465,13 +2239,9 @@ if (isTRUE(cfg$run_module3)) {
         )
       stats_summary_list[[var]] <- desc
       
-      # C) Post-Hoc Test (Who differs from whom?) - Only if Global is sig.
       if (!is.na(kw_test$p.value) && kw_test$p.value < 0.05) {
-        # Pairwise Wilcoxon with Benjamini-Hochberg (FDR) correction
-        pair_test <- pairwise.wilcox.test(curr_data$Value, curr_data$Group, 
+        pair_test <- pairwise.wilcox.test(curr_data$Value, curr_data$Group,
                                           p.adjust.method = "BH")
-        
-        # Transform triangular matrix into readable long table
         if (!is.null(pair_test$p.value)) {
           pair_df <- as.data.frame.table(pair_test$p.value) %>%
             stats::na.omit() %>%
@@ -2480,7 +2250,7 @@ if (isTRUE(cfg$run_module3)) {
               Variable = var,
               Is_Significant = P_Adj < 0.05
             ) %>%
-            dplyr::filter(Is_Significant == TRUE) # Keep only significant pairs to save space
+            dplyr::filter(Is_Significant == TRUE)
           
           stats_pairwise_list[[var]] <- pair_df
         }
@@ -2488,7 +2258,6 @@ if (isTRUE(cfg$run_module3)) {
     }
   }
   
-  # Export PhysChem Results
   if (length(stats_summary_list) > 0) {
     full_summary <- dplyr::bind_rows(stats_summary_list) %>% dplyr::select(Variable, everything())
     full_pairwise <- dplyr::bind_rows(stats_pairwise_list)
@@ -2502,25 +2271,17 @@ if (isTRUE(cfg$run_module3)) {
   }
   
   
-  # ---------- 3. CHEMICAL ENRICHMENT (Fisher's Exact Test) ----------
-  # Answers: "Does Species X produce more Flavonoids than expected by chance?"
-  
-  message("   -> Running Chemical Enrichment Tests (Fisher's Exact)...")
-  
-  # Identify class column (use Hybrid if exists, else ClassyFire)
   chem_col_stat <- if (exists("CHEM_COL_ALVO") && CHEM_COL_ALVO %in% names(df_props)) {
     CHEM_COL_ALVO 
   } else { "chemicalTaxonomyClassyfireClass" }
   
   if (chem_col_stat %in% names(df_props)) {
     
-    # Prepare data: only rows with valid class
     df_chem <- df_props %>%
       dplyr::filter(!is.na(.data[[chem_col_stat]]), 
                     nzchar(as.character(.data[[chem_col_stat]])),
                     .data[[tax_col]] %in% taxa_validos)
     
-    # List of Main Classes (Top 20 to avoid testing rare classes)
     top_classes <- df_chem %>%
       dplyr::count(Class = .data[[chem_col_stat]], sort=TRUE) %>%
       dplyr::slice_head(n = 20) %>%
@@ -2528,26 +2289,17 @@ if (isTRUE(cfg$run_module3)) {
     
     enrichment_list <- list()
     
-    # Loop Taxon x Class
     for (taxon in taxa_validos) {
       for (chem_cls in top_classes) {
-        
-        # Build Contingency Table (2x2)
-        #              | Belongs to Class | Does Not Belong
-        # ---------------------------------------------
-        # Is Taxon     | a                | b
-        # Is Not Taxon | c                | d
-        
         a <- sum(df_chem[[tax_col]] == taxon & df_chem[[chem_col_stat]] == chem_cls)
         b <- sum(df_chem[[tax_col]] == taxon & df_chem[[chem_col_stat]] != chem_cls)
         c <- sum(df_chem[[tax_col]] != taxon & df_chem[[chem_col_stat]] == chem_cls)
         d <- sum(df_chem[[tax_col]] != taxon & df_chem[[chem_col_stat]] != chem_cls)
         
-        # Only test if sufficient data
         if ((a + b) > 0 && (a + c) > 0) {
           fisher_res <- fisher.test(matrix(c(a, c, b, d), nrow = 2), alternative = "greater")
           
-          if (fisher_res$p.value < 0.05) { # Save only significant results
+          if (fisher_res$p.value < 0.05) {
             enrichment_list[[paste(taxon, chem_cls)]] <- data.frame(
               Taxon = taxon,
               Chemical_Class = chem_cls,
@@ -2560,11 +2312,10 @@ if (isTRUE(cfg$run_module3)) {
       }
     }
     
-    # Export Enrichment Results
     if (length(enrichment_list) > 0) {
       df_enrich <- dplyr::bind_rows(enrichment_list) %>%
         dplyr::arrange(Taxon, P_Value) %>%
-        dplyr::mutate(FDR_Adj_P = p.adjust(P_Value, method = "BH")) # False Discovery Rate adjustment
+        dplyr::mutate(FDR_Adj_P = p.adjust(P_Value, method = "BH"))
       
       out_enrich <- file.path(OUT_DIR, paste0(base_tag, "_STATS_Chem_Enrichment.xlsx"))
       writexl::write_xlsx(list(Enrichment_Results = df_enrich), path = out_enrich)
@@ -2574,19 +2325,13 @@ if (isTRUE(cfg$run_module3)) {
     message("      [Skipped] Chemical column not found for enrichment.")
   }
   
-  message(">>> PART IV COMPLETED.")
+  cat("Statistical suite done.\n")
 }
 
-# =====================================================================
-# PART V — SCAFFOLD INNOVATION & UNIQUENESS (Drug Discovery Metric)
-# =====================================================================
-
+## scaffold innovation
 if (isTRUE(cfg$run_module3) && exists("df_props")) {
-  
-  message("\n>>> STARTING PART V: SCAFFOLD INNOVATION ANALYSIS...")
-  
-  # 1. Preparar Dados de Esqueletos
-  # Filtra apenas compostos com esqueleto Murcko definido e taxa válidos
+  cat("Running scaffold innovation analysis...\n")
+
   df_scaff <- df_props %>%
     dplyr::filter(
       !is.na(murko_framework), 
@@ -2596,64 +2341,52 @@ if (isTRUE(cfg$run_module3) && exists("df_props")) {
     dplyr::select(inchikey, murko_framework, Taxon = !!rlang::sym(tax_col))
   
   if (nrow(df_scaff) > 0) {
-    
-    # 2. Calcular Métricas por Espécie/Táxon
     scaffold_stats <- df_scaff %>%
       dplyr::group_by(Taxon) %>%
       dplyr::summarise(
         N_Compounds = dplyr::n_distinct(inchikey),
         N_Scaffolds = dplyr::n_distinct(murko_framework),
-        # Taxa de Inovação: Quanto maior, mais diversidade estrutural real
         Innovation_Ratio = round(N_Scaffolds / N_Compounds, 3),
         .groups = "drop"
       ) %>%
       dplyr::arrange(dplyr::desc(Innovation_Ratio))
     
-    # 3. Identificar Esqueletos Exclusivos (Singletons)
-    # Conta em quantas espécies cada esqueleto aparece
     scaff_distribution <- df_scaff %>%
       dplyr::distinct(murko_framework, Taxon) %>%
       dplyr::count(murko_framework, name = "Species_Count")
     
-    # Filtra os que aparecem em apenas 1 espécie
     unique_scaffolds <- scaff_distribution %>% 
       dplyr::filter(Species_Count == 1) %>%
       dplyr::pull(murko_framework)
     
-    # Conta quantos exclusivos cada espécie tem
     exclusivity_stats <- df_scaff %>%
       dplyr::filter(murko_framework %in% unique_scaffolds) %>%
       dplyr::group_by(Taxon) %>%
       dplyr::summarise(
         N_Exclusive_Scaffolds = dplyr::n_distinct(murko_framework),
-        # Pega um exemplo de SMILES exclusivo para ilustrar
         Example_Exclusive_SMILES = dplyr::first(murko_framework),
         .groups = "drop"
       )
     
-    # 4. Consolidar Tabela Final
     final_stats <- scaffold_stats %>%
       dplyr::left_join(exclusivity_stats, by = "Taxon") %>%
       dplyr::mutate(
         N_Exclusive_Scaffolds = tidyr::replace_na(N_Exclusive_Scaffolds, 0),
-        # Porcentagem da diversidade que é exclusiva daquela espécie
         Pct_Exclusive = round((N_Exclusive_Scaffolds / N_Scaffolds) * 100, 1)
       ) %>%
       dplyr::arrange(dplyr::desc(N_Exclusive_Scaffolds))
     
-    # 5. Salvar
     out_scaff <- file.path(OUT_DIR, paste0(base_tag, "_STATS_Scaffold_Innovation.xlsx"))
     writexl::write_xlsx(list(Scaffold_Metrics = final_stats), path = out_scaff)
     
     message("      [Saved] Scaffold Innovation Stats: ", basename(out_scaff))
     
-    # Diagnóstico Rápido
     top_innovator <- final_stats$Taxon[1]
-    message("      -> Top Exclusive Species: ", top_innovator, 
-            " (", final_stats$N_Exclusive_Scaffolds[1], " unique scaffolds)")
+    cat("Top exclusive taxon:", top_innovator,
+        "(", final_stats$N_Exclusive_Scaffolds[1], "unique scaffolds)\n")
     
   } else {
     message("      [Skipped] No Murcko frameworks found in dataset.")
   }
-  message(">>> PART V COMPLETED.")
+  cat("Scaffold analysis done.\n")
 }

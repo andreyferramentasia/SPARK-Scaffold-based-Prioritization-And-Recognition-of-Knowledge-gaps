@@ -1,20 +1,4 @@
-# ==========================================================
-# MODULE 1 - EXTRACTION & NORMALIZATION (Part I)
-#
-# Purpose:
-#   1. Query LOTUS database (MongoDB) by Taxon (Family/Genus/Species).
-#   2. Retrieve chemical properties and cross-references.
-#   3. Normalize taxonomy using World Flora Online (WFO) backbone (Optional).
-#   4. Deduplicate and enrich data tables.
-#   5. Export baseline datasets (Excel/Parquet) for downstream analysis.
-#
-# Inputs:
-#   - 'cfg' list defined in the Main Pipeline.
-#
-# Outputs:
-#   - Global R objects: lin_enriched, uni_enriched, map_tax_inchi
-#   - Files in OUT_DIR: .xlsx and .parquet datasets
-# ==========================================================
+# Part I: extract LOTUS compounds for target taxon, enrich with properties, optionally normalize via WFO
 
 suppressPackageStartupMessages({
   library(mongolite)
@@ -25,26 +9,21 @@ suppressPackageStartupMessages({
   library(stringr)
   library(writexl)
   library(readr)
-  library(stringi)   
+  library(stringi)
 })
 
 options(OutDec = ".", scipen = 999)
 
-# --------------------------
-# HELPER FUNCTIONS
-# --------------------------
+## helpers
 
-# Fix malformed reference IDs
 fix_ref_id <- function(x) {
   x <- as.character(x)
   x <- stringr::str_squish(x)
   x[!nzchar(x)] <- NA_character_
-  # Replace placeholder pattern with "."
   x <- gsub("\\$x\\$x\\$", ".", x, perl = TRUE)
   x
 }
 
-# --- Canonicalization Helpers ---
 norm_ascii   <- function(x) stringi::stri_trans_general(x, "Latin-ASCII")
 tidy_space   <- function(x) trimws(gsub("\\s+", " ", x))
 
@@ -55,25 +34,24 @@ title_case_1 <- function(x){
   x
 }
 
-canon_genus  <- function(x){
+canon_genus <- function(x){
   x <- tidy_space(norm_ascii(x))
-  x <- sub("\\s+.*$", "", x)         # Keep only the first word
-  x <- gsub("[^A-Za-z-]", "", x)    # Remove numbers/punctuation
+  x <- sub("\\s+.*$", "", x)
+  x <- gsub("[^A-Za-z-]", "", x)
   ifelse(nzchar(x), title_case_1(x), NA_character_)
 }
 
-is_binomial  <- function(x){
+is_binomial <- function(x){
   x <- tidy_space(as.character(x))
-  grepl("^\\S+\\s+\\S+", x)         # At least two words
+  grepl("^\\S+\\s+\\S+", x)
 }
 
-# Fix "GenusEpithet" glued strings (e.g. "Ocoteaodorifera" -> "Ocotea odorifera")
+# "Ocoteaodorifera" -> "Ocotea odorifera"
 fix_glued_species <- function(genus, species){
   genus   <- as.character(genus)
   species <- as.character(species)
   needs   <- !is.na(genus) & !is.na(species) &
     mapply(function(g, s) grepl(paste0("^", g, "[A-Za-z]"), s), genus, species)
-
   if (any(needs)) {
     species[needs] <- mapply(function(g, s) sub(paste0("^(", g, ")([A-Za-z])"), "\\1 \\2", s),
                              genus[needs], species[needs])
@@ -81,9 +59,7 @@ fix_glued_species <- function(genus, species){
   species
 }
 
-# --------------------------
-# 0) READ/VALIDATE CONFIG
-# --------------------------
+## config
 
 normalize_taxon_mode <- function(x){
   x0 <- tolower(trimws(as.character(x %||% "")))
@@ -106,17 +82,15 @@ TAXON_VALUES <- cfg$taxon_values %||% character(0)
 TAXON_VALUES <- unique(na.omit(trimws(as.character(TAXON_VALUES))))
 if (length(TAXON_VALUES) == 0L) stop("TAXON_VALUES is empty after normalization.", call.=FALSE)
 
-# Mongo connection parameters
 MONGO_URL <- cfg$mongo_url %||%
   "mongodb://127.0.0.1:27017/?socketTimeoutMS=3600000&connectTimeoutMS=300000&serverSelectionTimeoutMS=300000"
 DB_NAME    <- cfg$db_name    %||% "lotus"
 COLL_NAME  <- cfg$coll_name  %||% "lotusUniqueNaturalProduct"
 opts       <- cfg$mongo_opts %||% '{"allowDiskUse": true, "batchSize": 5000}'
 
-PAGE        <- cfg$page_size_lines     %||% 50000L
-chunk_size  <- cfg$chunk_size_inchikey %||% 1000L
+PAGE       <- cfg$page_size_lines     %||% 50000L
+chunk_size <- cfg$chunk_size_inchikey %||% 1000L
 
-# Build safe file tag
 safe_tag <- function(mode, values, run_date, suffix = NULL) {
   tag <- paste(mode,
                paste(values, collapse = "-"),
@@ -139,7 +113,6 @@ tag_base <- if (!is.null(cfg$prefix_base_tag) && nzchar(cfg$prefix_base_tag)) {
   )
 }
 
-# Output directory
 out_dir_base <- cfg$out_dir_base %||% getwd()
 OUT_DIR <- file.path(out_dir_base, paste0("lotus_", tag_base))
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -147,7 +120,6 @@ dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 safe_file <- function(base, ext) file.path(OUT_DIR, paste0(base, ext))
 base_tag  <- paste0("lotus_", tag_base)
 
-# Core properties to retrieve
 PROPS_CORE_FIELDS <- cfg$props_core_fields %||% c(
   "lotus_id","wikidata_id","inchikey","smiles","iupac_name",
   "molecular_formula","molecular_weight",
@@ -174,19 +146,16 @@ safe_first <- function(x) {
   x[1]
 }
 
-# --------------------------
-# 1) CONNECT TO MONGO
-# --------------------------
-lotus <- mongo(collection = COLL_NAME, db = DB_NAME, url = MONGO_URL)
-if (isTRUE(cfg$verbose %||% TRUE)) {
-  cat("Connected. Total docs in DB:", lotus$count(), "\n")
-  cat(sprintf("[Part I] TAXON_MODE = %s | TAXON_VALUES = %s\n",
-              TAXON_MODE, paste(TAXON_VALUES, collapse=", ")))
-}
+## connect
 
-# --------------------------
-# 2) TAXON FILTER BUILDER
-# --------------------------
+lotus <- mongo(collection = COLL_NAME, db = DB_NAME, url = MONGO_URL)
+cat("Part I: connected, total docs:", lotus$count(), "\n")
+cat(sprintf("TAXON_MODE = %s | TAXON_VALUES = %s\n",
+            TAXON_MODE, paste(TAXON_VALUES, collapse=", ")))
+
+## taxon filter
+
+# regex special chars in taxon names need escaping before using as MongoDB $regex
 regex_escape <- function(x) {
   x <- as.character(x); x <- stringr::str_squish(x)
   gsub("([\\.^$|()?*+\\[\\]{}-])", "\\\\\\1", x, perl = TRUE)
@@ -196,7 +165,7 @@ build_taxon_match <- function(prefix, mode, values) {
   vals <- unique(na.omit(trimws(values)))
   vals <- vals[nzchar(vals)]
   if (!length(vals)) stop("Empty/invalid TAXON_VALUES.")
-  
+
   or_list <- list()
   for (v0 in vals) {
     v <- regex_escape(v0)
@@ -232,9 +201,8 @@ build_taxon_match <- function(prefix, mode, values) {
   list("$or" = or_list)
 }
 
-# --------------------------
-# 3) COUNT MATCHING ROWS
-# --------------------------
+## count matching rows
+
 pipe_count <- list(
   list("$project" = list(tx1 = list("$objectToArray" = "$taxonomyReferenceObjects"))),
   list("$unwind"  = "$tx1"),
@@ -246,14 +214,11 @@ pipe_count <- list(
 )
 cnt <- lotus$aggregate(jsonlite::toJSON(pipe_count, auto_unbox = TRUE), options = opts)
 total_lines <- if (nrow(cnt)) cnt$n[1] else 0L
-if (isTRUE(cfg$verbose %||% TRUE)) {
-  cat("Total matched rows (compound x ref x source x species): ", total_lines, "\n")
-}
+cat("Total matched rows (compound x ref x source x species):", total_lines, "\n")
 if (total_lines == 0) stop("Nothing to extract for this taxonomic criterion.")
 
-# --------------------------
-# 4) DATA EXTRACTION (LIN TABLE)
-# --------------------------
+## extract lin table
+
 n_batches <- ceiling(total_lines / PAGE)
 pb <- progress::progress_bar$new(
   format = "Batch :current/:total [:bar] :percent | rows=:rows | :elapsed (ETA :eta)",
@@ -296,21 +261,19 @@ data.table::setDF(lin)
 lin <- dplyr::distinct(lin, lotus_id, ref_id, source, family, genus, species,
                        inchikey, smiles, iupac_name, molecular_formula, .keep_all = TRUE)
 
-if (isTRUE(cfg$verbose %||% TRUE)) {
-  cat("\n✔ Rows loaded into memory:", nrow(lin), "\n")
-}
+cat("\nRows loaded into memory:", nrow(lin), "\n")
 lin <- lin %>%
   dplyr::mutate(ref_id = fix_ref_id(ref_id))
 
-# ---------- GENUS-MODE CONSISTENCY FILTER ----------
-# Ensures retrieved species actually belong to the target genus
+## genus-mode consistency filter
+# ensures retrieved species actually belong to the target genus
 if (identical(TAXON_MODE, "genus")) {
   target_gen <- unique(tolower(trimws(TAXON_VALUES)))
   target_gen <- target_gen[nzchar(target_gen)]
   esc <- function(x) gsub("([\\.^$|()?*+\\[\\]{}-])","\\\\\\1", x, perl=TRUE)
-  pat_gen  <- paste0("^(", paste(esc(target_gen), collapse="|"), ")$")   # Exact genus
-  pat_pref <- paste0("^(", paste(esc(target_gen), collapse="|"), ")\\s") # Genus prefix in species
-  
+  pat_gen  <- paste0("^(", paste(esc(target_gen), collapse="|"), ")$")
+  pat_pref <- paste0("^(", paste(esc(target_gen), collapse="|"), ")\\s")
+
   lin <- lin %>%
     dplyr::mutate(
       .g0   = tolower(trimws(genus)),
@@ -318,11 +281,9 @@ if (identical(TAXON_MODE, "genus")) {
       .s_ok = !is.na(.s0) & grepl(pat_pref, .s0, perl = TRUE),
       .g_ok = !is.na(.g0) & grepl(pat_gen,  .g0, perl = TRUE)
     )
-  
-  # Keep if species name matches pattern OR if genus name matches (and species name is mostly valid)
+
   keep_mask <- with(lin, (.s_ok) | (.g_ok & (is.na(.s0) | .s_ok)))
-  
-  # Audit log for dropped rows
+
   drop_df <- lin[!keep_mask, c("lotus_id","ref_id","source","family","genus","species")]
   if (nrow(drop_df)) {
     diag_dir <- file.path(OUT_DIR, "diagnostics")
@@ -332,19 +293,16 @@ if (identical(TAXON_MODE, "genus")) {
       file = file.path(diag_dir, paste0(base_tag, "_genus_mode_inconsistent_pairs.tsv")),
       sep = "\t", quote = TRUE
     )
-    message(sprintf("[FILTER] genus-mode: %d rows removed due to genus–species inconsistency (see diagnostics/).",
+    message(sprintf("[FILTER] genus-mode: %d rows removed due to genus-species inconsistency (see diagnostics/).",
                     nrow(drop_df)))
   }
-  
+
   lin <- lin[keep_mask, , drop = FALSE]
   lin$.g0 <- lin$.s0 <- lin$.s_ok <- lin$.g_ok <- NULL
 }
-# -----------------------------------------------------------
 
+## retrieve compound properties
 
-# --------------------------
-# 5) COMPOUND PROPERTIES RETRIEVAL
-# --------------------------
 fields_props <- sprintf(
   '{"_id":0,%s}',
   paste(sprintf('"%s":1', PROPS_CORE_FIELDS), collapse = ",")
@@ -387,13 +345,10 @@ for (j in seq_along(props_list)) {
 }
 props_core <- data.table::rbindlist(props_list, use.names = TRUE, fill = TRUE)
 props_core <- unique(as.data.frame(props_core))
-if (isTRUE(cfg$verbose %||% TRUE)) {
-  cat("✔ Chemical properties retrieved for unique InChIKeys: ", nrow(props_core), "\n")
-}
+cat("Chemical properties retrieved for", nrow(props_core), "unique InChIKeys.\n")
 
-# --------------------------
-# 6) DATA ENRICHMENT & CLEANING
-# --------------------------
+## enrich and clean
+
 unify_dupes <- function(df, bases = c("lotus_id","smiles","iupac_name",
                                       "molecular_formula","molecular_weight")) {
   for (b in bases) {
@@ -406,7 +361,6 @@ unify_dupes <- function(df, bases = c("lotus_id","smiles","iupac_name",
   df
 }
 
-# Join raw extraction with properties
 lin_enriched <- lin %>%
   dplyr::left_join(props_core, by = "inchikey") %>%
   unify_dupes()
@@ -424,22 +378,19 @@ LOGICAL_PROPS <- cfg$logical_props %||% c(
   "contains_ring_sugars","contains_linear_sugars","contains_sugar"
 )
 
-# Convert types
 lin_enriched <- lin_enriched %>%
   dplyr::mutate(dplyr::across(all_of(NUMERIC_PROPS), ~ suppressWarnings(as.numeric(.)))) %>%
   dplyr::mutate(dplyr::across(all_of(LOGICAL_PROPS), ~ {
     if (is.logical(.)) . else tolower(as.character(.)) %in% c("true","t","1")
   }))
 
+## WFO normalization (optional)
 
-# ==========================================================
-# 7) WFO NORMALIZATION (Optional)
-# ==========================================================
 USE_WFO <- isTRUE(cfg$use_WFO_normalization %||% TRUE)
 
 if (USE_WFO) {
-  cat("[WFO] Starting taxonomic normalization...\n")
-  
+  cat("WFO: normalizing taxonomy...\n")
+
   canon_name <- function(x) {
     x <- tolower(stringr::str_squish(as.character(x)))
     x <- gsub("\\s+\\(.*?\\)", "", x)
@@ -453,17 +404,17 @@ if (USE_WFO) {
       else tt[1] %||% NA_character_
     }, FUN.VALUE = character(1))
   }
-  
+
   mk_join_key_vec <- function(genus, species) {
     cand <- ifelse(!is.na(species) & nzchar(species), species, paste(genus, species))
     tolower(stringr::str_squish(cand))
   }
-  
+
   first_non_na_chr <- function(x) {
     x <- as.character(x); x <- x[!is.na(x) & nzchar(x)]
     if (length(x)) x[1] else NA_character_
   }
-  
+
   split_scientific2 <- function(nm){
     nm <- stringr::str_squish(as.character(nm))
     parts <- strsplit(nm, "\\s+")
@@ -474,8 +425,7 @@ if (USE_WFO) {
       stringsAsFactors = FALSE
     )
   }
-  
-  # --- Read WFO Backbone ---
+
   WFO_CSV_PATH <- cfg$wfo_csv_path %||%
     file.path(dirname(normalizePath(sys.frame(1)$ofile,
                                     mustWork = FALSE)),
@@ -487,16 +437,16 @@ if (USE_WFO) {
   col_accID   <- cfg$wfo_cols$acceptedNameUsageID %||% "acceptedNameUsageID"
   col_family  <- cfg$wfo_cols$family              %||% "family"
   col_genus   <- cfg$wfo_cols$genus               %||% "genus"
-  
+
   wfo_raw <- readr::read_tsv(
-    file   = WFO_CSV_PATH,
+    file      = WFO_CSV_PATH,
     col_types = readr::cols(.default = readr::col_character()),
     progress  = TRUE,
     locale    = readr::locale(encoding = "UTF-8"),
     na = c("", "NA", "NULL")
   )
   if (ncol(wfo_raw) == 1L) stop("WFO file invalid (check delimiters).")
-  
+
   wfo <- wfo_raw %>%
     transmute(
       taxonID  = .data[[col_taxonID]],
@@ -506,14 +456,14 @@ if (USE_WFO) {
       family   = .data[[col_family]],
       genus    = .data[[col_genus]]
     )
-  
+
   accepted <- wfo %>%
     filter(status == "accepted") %>%
     transmute(accepted_id = taxonID, accepted_name = name)
-  
+
   synonyms <- wfo %>%
     filter(status != "accepted", !is.na(accID), nzchar(accID))
-  
+
   syn_map <- synonyms %>%
     left_join(accepted, by = c("accID" = "accepted_id")) %>%
     transmute(
@@ -522,25 +472,22 @@ if (USE_WFO) {
       accepted_name = accepted_name,
       accepted_id   = accID
     )
-  
+
   acc_key <- accepted %>%
     transmute(key = canon_name(accepted_name), accepted_name, accepted_id) %>%
     filter(!is.na(key) & nzchar(key)) %>%
     distinct(key, .keep_all = TRUE)
-  
+
   syn_key <- syn_map %>%
     transmute(key = canon_name(synonym_name), accepted_name, accepted_id) %>%
     filter(!is.na(key) & nzchar(key)) %>%
     distinct(key, .keep_all = TRUE)
-  
+
   dict <- bind_rows(acc_key, syn_key) %>%
     distinct(key, .keep_all = TRUE)
-  
-  if (isTRUE(cfg$verbose %||% TRUE)) {
-    cat("[WFO] Dictionary loaded:", nrow(dict), "unique keys.\n")
-  }
-  
-  # --- Resolve Names ---
+
+  cat("WFO: dictionary loaded:", nrow(dict), "unique keys.\n")
+
   lin_join <- mk_join_key_vec(lin$genus, lin$species)
   resolved <- data.frame(
     original_name = lin_join,
@@ -557,7 +504,7 @@ if (USE_WFO) {
       ),
       tax_checked_at = TODAY_STR
     )
-  
+
   crosswalk_wfo <- resolved %>%
     transmute(original_name, accepted_name, accepted_id, tax_status,
               tax_provider, tax_checked_at) %>%
@@ -570,11 +517,11 @@ if (USE_WFO) {
       tax_checked_at = first_non_na_chr(tax_checked_at),
       .groups = "drop"
     )
-  
+
   lin_wfo <- lin_enriched %>%
     mutate(.original_name = mk_join_key_vec(genus, species)) %>%
     left_join(crosswalk_wfo, by = c(".original_name" = "original_name"))
-  
+
   accepted_meta <- wfo %>%
     filter(status == "accepted") %>%
     transmute(
@@ -584,8 +531,7 @@ if (USE_WFO) {
       accepted_genus  = genus
     ) %>%
     distinct(accepted_id, .keep_all = TRUE)
-  
-  # Ensure columns exist
+
   for (col in c("genus","species","family")) {
     if (!col %in% names(lin_wfo)) lin_wfo[[col]] <- NA_character_
   }
@@ -594,8 +540,7 @@ if (USE_WFO) {
     species = as.character(species),
     family  = as.character(family)
   )
-  
-  # Apply corrections
+
   lin_applied <- lin_wfo %>%
     mutate(
       .corr_scientific = dplyr::coalesce(accepted_name, .original_name),
@@ -620,12 +565,11 @@ if (USE_WFO) {
       genus   = dplyr::coalesce(corrected_genus, genus),
       family  = dplyr::coalesce(corrected_family, family)
     )
-  
+
   lin_enriched <- lin_applied
-  cat("[WFO] Normalization applied successfully.\n")
-  
-  # --- Post-WFO Filter (Genus Mode Only) ---
-  # If WFO reclassified a species out of the target genus, drop it.
+  cat("WFO: normalization applied.\n")
+
+  # if WFO reclassified a species out of the target genus, drop it
   genus_or_lower <- function(x) tolower(tidy_space(as.character(x)))
   if (nrow(lin_enriched) > 0) {
     genus_original <- genus_or_lower(coalesce(lin_enriched$genus_original, lin_enriched$genus))
@@ -633,44 +577,38 @@ if (USE_WFO) {
                                               lin_enriched$corrected_genus,
                                               lin_enriched$genus))
     target_genera_norm <- genus_or_lower(cfg$taxon_values)
-    
+
     unresolved_flag   <- grepl("unresolved",
                                tolower(coalesce(lin_enriched$tax_status, lin_enriched$taxonomy_action, "")),
                                fixed = TRUE)
     reclassified_flag <- (nzchar(genus_original) & nzchar(genus_final) & (genus_original != genus_final))
     outside_target    <- !(genus_final %in% target_genera_norm)
-    
+
     remove_vec <- rep(FALSE, nrow(lin_enriched))
     if (identical(tolower(cfg$taxon_mode), "genus")) {
       remove_vec <- (outside_target | reclassified_flag)
     }
     keep_row <- (!unresolved_flag) & (!remove_vec)
-    
+
     lin_enriched <- lin_enriched[keep_row, , drop = FALSE]
-    cat(sprintf("[WFO] After canonical genus filter: %d rows kept.\n", nrow(lin_enriched)))
+    cat(sprintf("WFO: after genus filter: %d rows kept.\n", nrow(lin_enriched)))
   }
 }
 
-# --------------------------
-# 8) BASIC CLEANING (Canonicalization)
-# --------------------------
+## canonicalize
+
 lin_enriched <- lin_enriched %>%
   mutate(
-    # 1) Canonize genus
     genus   = canon_genus(genus),
-    # 2) Remove "sp." and extra spaces
     species = gsub("\\bsp\\.?\\b", "", species, ignore.case = TRUE),
     species = stringr::str_squish(species),
-    # 3) Fix "GenusEpithet"
     species = fix_glued_species(genus, species)
   )
 
-# --------------------------
-# 9) FINAL DEDUPLICATION
-# --------------------------
+## final deduplication
+
 dedup_before <- nrow(lin_enriched)
 
-# Deduplicate at [Compound + Species + Reference] level
 lin_enriched <- lin_enriched %>%
   dplyr::arrange(inchikey, family, genus, species, ref_id, source) %>%
   dplyr::distinct(
@@ -684,14 +622,11 @@ cat(sprintf(
   dedup_before, dedup_after, dedup_before - dedup_after
 ))
 
-# --------------------------
-# 10) MAP & TABLE BUILDING
-# --------------------------
+## build tables
 
-# Build Map: Taxon -> InChIKey
 build_map_tax_inchi <- function(lin_tbl, tax_col = c("family","genus","species")){
   tax_col <- match.arg(tax_col)
-  
+
   out <- lin_tbl %>%
     dplyr::transmute(
       inchikey = as.character(inchikey),
@@ -705,8 +640,7 @@ build_map_tax_inchi <- function(lin_tbl, tax_col = c("family","genus","species")
       species = fix_glued_species(genus, species)
     ) %>%
     dplyr::filter(!is.na(inchikey), nzchar(inchikey))
-  
-  # Minimum validity filters per level
+
   if (identical(tax_col, "genus")) {
     out <- out %>%
       dplyr::filter(!is.na(genus), nzchar(genus))
@@ -717,7 +651,7 @@ build_map_tax_inchi <- function(lin_tbl, tax_col = c("family","genus","species")
     out <- out %>%
       dplyr::filter(!is.na(family), nzchar(family))
   }
-  
+
   out <- out %>%
     dplyr::mutate(
       taxon = dplyr::case_when(
@@ -729,16 +663,15 @@ build_map_tax_inchi <- function(lin_tbl, tax_col = c("family","genus","species")
     ) %>%
     dplyr::filter(!is.na(taxon), nzchar(taxon)) %>%
     dplyr::distinct(inchikey, taxon, family, genus, species)
-  
+
   if (!tax_col %in% names(out)) out[[tax_col]] <- out$taxon
   out
 }
 
 tax_col_for_map <- cfg$analysis_tax_level %||% "genus"
 map_tax_inchi <- build_map_tax_inchi(lin_enriched, tax_col = tax_col_for_map)
-cat(sprintf("[Map] Map built at %s-level. Rows: %d\n", tax_col_for_map, nrow(map_tax_inchi)))
+cat(sprintf("[Map] %s-level map: %d rows.\n", tax_col_for_map, nrow(map_tax_inchi)))
 
-# Build Unique Compound Tables (UNI & UNI_ENRICHED)
 lin_dt2 <- data.table::as.data.table(lin_enriched)
 uni <- lin_dt2[, .(
   lotus_id          = safe_first(lotus_id),
@@ -761,17 +694,14 @@ uni_enriched <- uni %>%
     })
   )
 
-if (isTRUE(cfg$verbose %||% TRUE)) {
-  cat("✔ UNI tables built. UNI:", nrow(uni), "rows | UNI_ENRICHED:", nrow(uni_enriched), "rows.\n")
-}
+cat("UNI:", nrow(uni), "rows | UNI_ENRICHED:", nrow(uni_enriched), "rows.\n")
 
-# Optional: Collapsed Table (Compound x Species)
 dedup_compound_species <- function(df) {
   num_cols  <- names(df)[vapply(df, is.numeric,  logical(1))]
   logi_cols <- names(df)[vapply(df, is.logical, logical(1))]
   chr_cols  <- names(df)[vapply(df, is.character, logical(1))]
   chr_cols  <- setdiff(chr_cols, c("inchikey","family","genus","species","ref_id","source"))
-  
+
   df %>%
     dplyr::group_by(inchikey, species) %>%
     dplyr::summarise(
@@ -789,10 +719,8 @@ dedup_compound_species <- function(df) {
 lin_cs <- dedup_compound_species(lin_enriched)
 cat(sprintf("[Dedup CS] Compound x Species table: %d rows.\n", nrow(lin_cs)))
 
+## export
 
-# --------------------------
-# 11) EXPORT
-# --------------------------
 EXPORT_EXCEL   <- isTRUE(cfg$export_excel   %||% TRUE)
 EXPORT_PARQUET <- isTRUE(cfg$export_parquet %||% TRUE)
 
@@ -832,13 +760,13 @@ if (EXPORT_EXCEL) {
     df <- dplyr::mutate(df, dplyr::across(where(is.character), trim_cell))
     df
   }
-  
+
   lin_x          <- sanitize_for_excel(lin,           drop_cols = intersect(BIG_COLS, names(lin)))
   lin_enriched_x <- sanitize_for_excel(lin_enriched,  drop_cols = intersect(BIG_COLS, names(lin_enriched)))
   uni_x          <- sanitize_for_excel(uni,           drop_cols = intersect(BIG_COLS, names(uni)))
   uni_enriched_x <- sanitize_for_excel(uni_enriched,  drop_cols = intersect(BIG_COLS, names(uni_enriched)))
   lin_cs_x       <- sanitize_for_excel(lin_cs,        drop_cols = intersect(BIG_COLS, names(lin_cs)))
-  
+
   xlsx_path <- safe_file(base_tag, ".xlsx")
   writexl::write_xlsx(
     list(
@@ -850,7 +778,7 @@ if (EXPORT_EXCEL) {
     ),
     path = xlsx_path
   )
-  cat("\n✔ Excel export saved at:", normalizePath(xlsx_path), "\n")
+  cat("Excel saved:", normalizePath(xlsx_path), "\n")
 }
 
 if (EXPORT_PARQUET) {
@@ -861,7 +789,7 @@ if (EXPORT_PARQUET) {
     arrow::write_parquet(lin_enriched, safe_file(paste0(base_tag, "_lin_enriched"),         ".parquet"))
     arrow::write_parquet(uni_enriched, safe_file(paste0(base_tag, "_uni_enriched"),         ".parquet"))
     arrow::write_parquet(lin_cs,       safe_file(paste0(base_tag, "_lin_compound_species"), ".parquet"))
-    cat("✔ Parquet export saved at:", normalizePath(OUT_DIR), "\n")
+    cat("Parquet saved:", normalizePath(OUT_DIR), "\n")
   } else {
     warning("Package 'arrow' not available; skipping Parquet export.")
   }
